@@ -58,15 +58,20 @@ npm install && npm run dev
 
 ```bash
 cd Tutor-Chatbot-main/backend
-python run_tests.py        # 纯逻辑测试，不花钱不联网
+python run_tests.py        # 纯逻辑测试，不花钱不联网（81 例）
 python smoke_chat.py       # 真实调用 LLM，验多轮讲解深度递进
 python smoke_db.py         # 验持久化与成员校验（需服务在跑）
 python smoke_profile.py    # 验学生画像自动沉淀（需服务在跑）
+python smoke_personalize.py # 验同一道题在两种画像下讲法不同（需服务在跑）
+python smoke_resource.py   # 验教师备课大纲与 .pptx 生成（需服务在跑）
 ```
+
+各接口有独立限流（`/chat` 10 次/分钟、`/resources/ppt-outline` 5 次/分钟），
+同一脚本一分钟内别连着跑两遍。
 
 ## 当前进度
 
-按 `DEVELOPMENT_PLAN.md` 的十二个阶段推进，已完成前六个：
+按 `DEVELOPMENT_PLAN.md` 的十二个阶段推进，已完成前八个：
 
 | 阶段 | 内容 | 状态 |
 |---|---|---|
@@ -74,8 +79,10 @@ python smoke_profile.py    # 验学生画像自动沉淀（需服务在跑）
 | 四 | MySQL 持久化（六张表） | ✅ |
 | 五 | 教室 / 成员 / 角色 + 教学状态落库 | ✅ |
 | 六 | StudentProfile 学生画像 | ✅ |
-| 七 | 个性化 Prompt | 进行中 |
-| 八 | Teacher Resource Agent | 待做 |
+| 七 | 个性化 Prompt（画像 + RAG + 问题 组合进提示词） | ✅ |
+| 八 | Teacher Resource Agent（备课大纲 JSON + .pptx） | ✅ |
+| 九 | 前后端联调 | 待前端 |
+| 十~十二 | 测试、性能记录、项目整理 | 收尾 |
 
 改造过程与踩坑记录在 `tutorial.md`，每一阶段一个 git 提交。
 

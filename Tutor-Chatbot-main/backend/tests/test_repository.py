@@ -6,6 +6,14 @@
 背景：T4 的状态恢复只按课堂取最后一条消息。单人课堂看不出问题，
 一旦同一个课堂里有两个学生，A 的 topic / hint_level 就会被 B 继承，
 表现为「新学生第一次提问就拿到第 3 层讲解」。
+
+两个函数的 user_id 参数语义不同，别搞混：
+
+- `load_last_state(user_id=...)`：**永远按学生隔离**。讲解深度是 per-student
+  的，共享就等于废掉个性化。
+- `load_history(user_id=...)`：这是「群聊 / 单独聊」开关。不传 = 群聊
+  （当前产品形态，同学之间能接力追问）；传了 = 只看这个人的对话线
+  （未来做单独聊时用）。
 """
 
 import sys
@@ -76,12 +84,25 @@ class IsolationTests(unittest.TestCase):
         self.assertEqual(load_last_state(self.db, self.room.id, fresh.id), ("", 0))
 
     def test_history_is_per_student(self):
+        """传 user_id 时是「单独聊」：只看这个人的对话线。"""
         self._turn(self.a.id, "死锁", 1, "死锁是什么")
         self._turn(self.b.id, "tcp三次握手", 1, "握手是什么")
         history = load_history(self.db, self.room.id, self.a.id)
         contents = [h.content for h in history]
         self.assertIn("死锁是什么", contents)
         self.assertNotIn("握手是什么", contents)
+
+    def test_history_without_user_id_is_group_chat(self):
+        """不传 user_id 时是「群聊」：课堂里所有人的问答都要看得见。
+
+        当前产品形态是共用聊天室，同学要能看到彼此的提问，
+        B 才能接在 A 的问答后面追问「那怎么预防」。
+        """
+        self._turn(self.a.id, "死锁", 1, "死锁是什么")
+        self._turn(self.b.id, "tcp三次握手", 1, "握手是什么")
+        contents = [h.content for h in load_history(self.db, self.room.id)]
+        self.assertIn("死锁是什么", contents)
+        self.assertIn("握手是什么", contents)
 
     def test_legacy_null_messages_stay_visible(self):
         """老数据里 assistant 回复不记归属，升级后不能凭空断掉上下文。"""

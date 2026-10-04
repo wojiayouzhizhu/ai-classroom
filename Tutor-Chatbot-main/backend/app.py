@@ -18,7 +18,7 @@ from fastapi import FastAPI, File, HTTPException, Request, UploadFile
 # cwd 里根本没有 .env。
 load_dotenv(Path(__file__).resolve().parent / ".env")  # noqa: E402
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import Response, StreamingResponse
+from fastapi.responses import FileResponse, Response, StreamingResponse
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage
 from pydantic import BaseModel, Field
 from slowapi import Limiter, _rate_limit_exceeded_handler
@@ -36,6 +36,8 @@ from agent.personalize import (
 from agent.profiler import apply_turn, derive_level, get_or_create_profile, profile_to_dict
 from agent.rag.indexer import build_index, load_knowledge_index
 from agent.rag.retriever import get_knowledge_context, get_relevant_context
+from agent.resource_agent import OutlineError, generate_outline, outline_to_dict
+from agent.resource_pptx import build_pptx
 from agent.state import ChatRequest, HistoryMessage, HINT_STRATEGIES, TutorState
 from sqlalchemy import select
 
@@ -265,9 +267,15 @@ async def chat(request: Request, body: ChatRequest):
                                 f"classroom {classroom_id}."
                             ),
                         )
-                    # 历史与状态都按学生隔离：同一个课堂里别人的问答
-                    # 混进上下文，会让「还是不懂」这类追问指代错人。
-                    db_history = load_history(db, classroom_id, body.user_id)
+                    # 上下文用「群聊」全量，状态用「这个学生」自己的。
+                    # 两者刻意分开：
+                    # - 上下文共享，同学之间才能接力追问（A 问了死锁，
+                    #   B 接着问「那怎么预防」才接得上）；
+                    # - 状态按学生隔离，否则 B 会继承 A 讲到第 3 层的深度，
+                    #   个性化讲解就废了。
+                    # load_history 的 user_id 就是「群聊 / 单独聊」开关：
+                    # 不传 = 群聊（当前），传了 = 只看这个人的对话线。
+                    db_history = load_history(db, classroom_id)
                     if db_history:
                         history = deserialize_history(db_history)
                     # 服务端是状态的唯一真相源：只要落了 classroom_id，
@@ -594,6 +602,12 @@ def api_add_member(classroom_id: int, body: AddMemberRequest):
 
 @app.get("/classrooms/{classroom_id}/messages")
 def api_list_messages(classroom_id: int, limit: int = 100):
+    """课堂全量消息（群聊视图）。
+
+    不管 AI 内部按谁隔离上下文，这个端点一律返回整个课堂的对话——
+    前端画聊天室要的是「所有人都能看到彼此」，助教/教师也要看全量。
+    username 一并给出，否则前端分不清哪条是谁说的（AI 的回复为 null）。
+    """
     _require_db()
     limit = max(1, min(limit, 500))
     with get_db() as db:
@@ -605,6 +619,7 @@ def api_list_messages(classroom_id: int, limit: int = 100):
             {
                 "id": m.id,
                 "user_id": m.user_id,
+                "username": m.user.username if m.user else None,
                 "role": m.role,
                 "content": m.content,
                 "topic": m.topic,
@@ -816,6 +831,129 @@ def api_prompt_preview(
     result["classroom_id"] = classroom_id
     result["profile"] = profile
     return result
+
+
+# --- T7：教师备课资源（Teacher Resource Agent）---------------------------
+# 教师给一个主题 → 检索常驻八股知识库 → 生成大纲 JSON + 一个 .pptx 文件。
+
+
+class PptOutlineRequest(BaseModel):
+    topic: str = Field(..., min_length=1, max_length=100)
+    classroom_id: int
+    teacher_id: int
+    # 受众水平：beginner / intermediate / advanced，留空让模型自己判断
+    audience: Literal["", "beginner", "intermediate", "advanced"] = ""
+
+
+def _require_teacher(db, classroom_id: int, teacher_id: int) -> None:
+    """备课是教师专属动作，学生不能拿它批量生成讲义。"""
+    if db.get(User, teacher_id) is None:
+        raise HTTPException(
+            status_code=404, detail=f"User {teacher_id} not found."
+        )
+    if db.get(Classroom, classroom_id) is None:
+        raise HTTPException(
+            status_code=404, detail=f"Classroom {classroom_id} not found."
+        )
+    membership = (
+        db.execute(
+            select(ClassroomMember).where(
+                ClassroomMember.classroom_id == classroom_id,
+                ClassroomMember.user_id == teacher_id,
+            )
+        )
+        .scalars()
+        .first()
+    )
+    if membership is None:
+        raise HTTPException(
+            status_code=403,
+            detail=f"User {teacher_id} is not a member of classroom {classroom_id}.",
+        )
+    if membership.role != "teacher":
+        raise HTTPException(
+            status_code=403,
+            detail=(
+                f"User {teacher_id} joined classroom {classroom_id} as "
+                f"'{membership.role}', not as a teacher."
+            ),
+        )
+
+
+@app.post("/resources/ppt-outline")
+@limiter.limit("5/minute")
+async def api_ppt_outline(request: Request, body: PptOutlineRequest):
+    """生成备课大纲：返回结构化 JSON，同时落一个 .pptx 文件。"""
+    _require_db()
+    try:
+        llm = get_llm()
+    except ValueError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+
+    with get_db() as db:
+        _require_teacher(db, body.classroom_id, body.teacher_id)
+
+    # 备课最怕模型凭印象讲错，所以知识库检索是硬要求
+    context = await asyncio.to_thread(
+        get_knowledge_context, get_knowledge_store(), body.topic
+    )
+
+    try:
+        outline = await generate_outline(llm, body.topic, context, body.audience)
+    except OutlineError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(
+            status_code=502,
+            detail="The configured language model could not generate the outline.",
+        ) from exc
+
+    # 结构合法但内容全空的大纲，渲染出来就是一张封面的 PPT。
+    # 这时候报失败让教师重试，比让他拿个空壳去上课好。
+    if outline.is_shell():
+        raise HTTPException(
+            status_code=502,
+            detail="模型返回了一份空大纲，请重试。",
+        )
+
+    try:
+        path = build_pptx(outline, subtitle=f"课堂 {body.classroom_id}")
+    except Exception as exc:
+        # 大纲已经生成好了，PPT 渲染失败不该让这次备课整个白做
+        print(f"[pptx] 渲染失败（大纲照常返回）：{exc}", flush=True)
+        path = ""
+
+    return {
+        "topic": body.topic,
+        "classroom_id": body.classroom_id,
+        "audience": body.audience,
+        "retrieved": bool(context),
+        "outline": outline_to_dict(outline),
+        "file_path": path,
+        "file_name": os.path.basename(path) if path else None,
+        "download_url": f"/resources/files/{os.path.basename(path)}" if path else None,
+    }
+
+
+@app.get("/resources/files/{file_name}")
+def api_download_resource(file_name: str):
+    """下载生成的 .pptx。只认文件名，不认路径——防目录穿越。"""
+    directory = Path(
+        os.getenv("RESOURCE_OUTPUT_DIR")
+        or Path(__file__).resolve().parent / "generated"
+    )
+    safe_name = os.path.basename(file_name)
+    path = directory / safe_name
+    if not path.is_file():
+        raise HTTPException(status_code=404, detail=f"{safe_name} not found.")
+    return FileResponse(
+        str(path),
+        filename=safe_name,
+        media_type=(
+            "application/vnd.openxmlformats-officedocument."
+            "presentationml.presentation"
+        ),
+    )
 
 
 @app.post("/upload")

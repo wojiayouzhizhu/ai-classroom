@@ -1,8 +1,9 @@
 """AI Classroom 使用的提示词模板。
 
-只保留真正被 agent/graph.py 引用的两个模板；
-回答阶段的策略表在 agent/state.py 的 HINT_STRATEGIES，
-提示拼装在 app.py（历史原因：RESPOND/CONGRATS 在 app.py 内联拼接）。
+- 对话链路：EXTRACT_TOPIC / ASSESS_UNDERSTANDING 被 agent/graph.py 引用
+- 备课链路（T7）：PPT_OUTLINE_PROMPT 被 agent/resource_agent.py 引用
+- 回答阶段的策略表在 agent/state.py 的 HINT_STRATEGIES，
+  提示拼装在 app.py（历史原因：RESPOND/CONGRATS 在 app.py 内联拼接）
 """
 
 
@@ -56,4 +57,34 @@ ASSESS_UNDERSTANDING_PROMPT = """你在评估一名正在准备面试的学生�
 - 当前问题没解决之前，不要降低 hint_level。
 - resolved=true 时，hint_level 设为 0、misconception 设为空字符串，让下一个知识点重新开始。
 - misconception 用中文一句话概括学生具体哪里理解错了；学生没有明显错误时填空字符串。
+- 只返回 JSON 对象，不要任何其他文字。"""
+
+
+PPT_OUTLINE_PROMPT = """你是计算机八股（面试知识点）课程的备课助手。请为教师准备一份关于「{topic}」的课堂讲义大纲。
+
+{audience_line}
+知识库资料（有则优先依据，没有就用你自己的知识，但不要编造来源）：
+{context}
+
+只返回 JSON，结构如下：
+{{
+  "title": "本讲标题",
+  "objectives": ["教学目标 1", "教学目标 2"],
+  "sections": [
+    {{"title": "章节标题", "points": ["该章节要点 1", "要点 2"]}}
+  ],
+  "key_points": ["面试常考要点 1", "要点 2"],
+  "examples": ["例子或场景 1", "例子 2"],
+  "questions": ["课堂上可提问的问题 1", "问题 2"],
+  "summary": ["一句话总结 1", "总结 2"]
+}}
+
+规则：
+- 全部用中文，面向正在准备面试的学生。
+- sections 给 3-5 个章节，每章 2-4 个要点，按「是什么 → 为什么 → 怎么用 → 面试怎么考」的顺序组织。
+- key_points 是面试最常问、最值得背下来的点，不要和 sections 要点重复罗列。
+- examples 要具体：给场景、代码或数值，不要只写「举个死锁的例子」。
+- questions 是教师课堂上用来确认学生是否真懂的追问，要有区分度。
+- summary 控制在 2-3 条，每条一句话能说完。
+- 不要编造资料中不存在的来源、页码或链接。
 - 只返回 JSON 对象，不要任何其他文字。"""
