@@ -1,0 +1,12 @@
+# Backend
+backend/venv/
+backend/.env
+
+# Frontend (already handled by frontend/.gitignore but just in case)
+frontend/node_modules/
+frontend/.next/
+
+# General
+__pycache__/
+*.pyc
+.DS_Store

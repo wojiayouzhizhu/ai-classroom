@@ -1,0 +1,7 @@
+# 本地运行产物
+*.log
+.uvicorn.log
+.pip.log
+
+# 本机工作数据（非源码，不进版本库）
+.workbuddy/
