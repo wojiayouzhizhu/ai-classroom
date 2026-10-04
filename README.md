@@ -86,6 +86,10 @@ python smoke_resource.py   # 验教师备课大纲与 .pptx 生成（需服务�
 
 改造过程与踩坑记录在 `tutorial.md`，每一阶段一个 git 提交。
 
+阶段性的开发总结见 `PROJECT_REPORT.md`：记录了 T0–T7 遇到的 10 个设计问题
+（含选型理由）、11 个 bug（含根因与修复理由）、6 张表的设计取舍，以及核心
+算法与验证体系。
+
 ## 二次开发声明
 
 本项目基于开源项目 Tutor-Chatbot 二次开发。原项目提供了 Chat、Agent、RAG
