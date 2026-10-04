@@ -30,14 +30,11 @@ MAX_UPLOAD_BYTES = max(
 MAX_DOCUMENT_SESSIONS = max(1, int(os.getenv("MAX_DOCUMENT_SESSIONS", "100")))
 SESSION_TTL_SECONDS = max(1, int(os.getenv("SESSION_TTL_SECONDS", "3600")))
 
-RAG_GROUNDING_RULES = """Uploaded-PDF grounding requirements:
-- Use only the supplied PDF evidence for claims about the document.
-- Do not infer authors from bibliography entries.
-- Do not infer the document's author from examples discussed in the paper.
-- For title or author questions, use only the DOCUMENT FRONT MATTER section.
-- Cite the PDF page and line range for factual claims.
-- If the evidence does not answer the question, say that it is not available.
-- Never invent a person, title, citation, page, or line."""
+RAG_GROUNDING_RULES = """知识库资料使用要求：
+- 涉及资料内容的结论，优先依据下面提供的资料片段回答。
+- 资料没覆盖的部分，可以用你自己的知识补充，但要说清这是补充内容。
+- 不要编造资料中不存在的来源、页码、链接或原文。
+- 如果资料与常识冲突，以资料为准，并指出这个差异。"""
 
 limiter = Limiter(key_func=get_remote_address)
 
@@ -120,7 +117,7 @@ def add_rag_grounding(prompt: str, rag_context: str) -> str:
     return (
         f"{prompt}\n\n"
         f"{RAG_GROUNDING_RULES}\n\n"
-        "PDF evidence:\n"
+        "知识库资料：\n"
         f"{rag_context}"
     )
 
@@ -174,9 +171,9 @@ async def chat(request: Request, body: ChatRequest):
                 try:
                     prompt = add_rag_grounding(
                         (
-                            "Answer the student's question about the uploaded PDF "
-                            "concisely and helpfully.\n\n"
-                            f"Student question:\n{body.message}"
+                            "你是计算机八股辅导助手。依据下面给出的知识库资料，"
+                            "简洁、准确地回答学生的问题。\n\n"
+                            f"学生提问：\n{body.message}"
                         ),
                         rag_context,
                     )
@@ -204,9 +201,9 @@ async def chat(request: Request, body: ChatRequest):
         async def unknown_stream():
             try:
                 prompt = (
-                    "You are a CS tutor. The student hasn't told you what they "
-                    "want to learn yet. Greet the student and politely ask what "
-                    "CS or programming concept they'd like to explore today."
+                    "你是计算机八股（面试知识点）辅导助手。学生还没说想学什么。"
+                    "用中文简短打个招呼，并请他告诉你想了解哪个计算机知识点，"
+                    "例如进程与线程、TCP 三次握手、MySQL 索引、垃圾回收等。"
                 )
                 async for chunk in llm.astream([HumanMessage(content=prompt)]):
                     token = chunk.content
@@ -232,35 +229,33 @@ async def chat(request: Request, body: ChatRequest):
         try:
             strategy = HINT_STRATEGIES[assessment_state["hint_level"]]
             misconception_note = (
-                "The student's specific misconception is: "
+                "学生目前的具体理解偏差是："
                 f"{assessment_state['misconception']}"
+                "。讲解时优先纠正这一点。"
                 if assessment_state["misconception"]
-                else "You don't yet know their specific misconception."
+                else "目前还不知道学生的具体理解偏差，按常规讲法讲解。"
             )
 
             if assessment_state["resolved"]:
                 system_content = (
-                    "You are a Socratic CS tutor. The student has just "
-                    f"successfully understood: {assessment_state['topic']}\n"
-                    "Give a warm, brief (2-3 sentence) congratulation. "
-                    "Reinforce the key insight they discovered."
+                    "你是计算机八股（面试知识点）辅导助手。学生刚刚掌握了："
+                    f"{assessment_state['topic']}\n"
+                    "用中文给一句简短的肯定（1-2 句），点出这个知识点面试时"
+                    "最值得记住的那一句话，然后问他要不要继续下一个知识点。"
                 )
             else:
-                reveal_instruction = (
-                    "You may now reveal the answer fully and clearly."
-                    if assessment_state["hint_level"] == 3
-                    else "Do NOT give the direct answer."
-                )
-                system_content = f"""You are a Socratic CS tutor teaching: {assessment_state['topic']}
+                system_content = f"""你是计算机八股（面试知识点）辅导助手，当前正在讲解：{assessment_state['topic']}
 
-Your current strategy: {strategy}
+当前讲解深度要求：{strategy}
 
 {misconception_note}
 
-Rules:
-- Be concise and conversational (3-6 sentences max).
-- Never lecture. Guide with questions and analogies.
-- {reveal_instruction}"""
+规则：
+- 全程用中文回答，面向正在准备面试的学生。
+- 可以直接给出答案，不需要反问、不需要启发式铺垫。
+- 语言精炼，去掉寒暄和废话；能用分点就用分点。
+- 涉及术语、定义、流程时，优先使用业界公认的标准说法。
+- 讲解结束后，最多追问一句，确认学生是否理解。"""
 
             system_content = add_rag_grounding(system_content, rag_context)
 

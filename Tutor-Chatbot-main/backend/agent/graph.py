@@ -17,7 +17,7 @@ DEFAULT_MODELS = {
     "ollama": "llama3.2",
     "groq": "openai/gpt-oss-120b",
     "gemini": "gemini-2.5-flash-lite",
-    "openai": "glm-4.7-flash",
+    "openai": "deepseek-flash",
 }
 
 
@@ -60,8 +60,10 @@ def get_llm(provider: str | None = None):
         return ChatGoogleGenerativeAI(model=model, temperature=0.4)
 
     if provider == "openai":
-        # Generic OpenAI-compatible endpoint (Zhipu GLM, SiliconFlow,
-        # DashScope, DeepSeek...). Configure via LLM_API_KEY / LLM_BASE_URL.
+        # Generic OpenAI-compatible endpoint (DeepSeek, Zhipu GLM, SiliconFlow,
+        # DashScope...). Configure via LLM_API_KEY / LLM_BASE_URL / LLM_MODEL.
+        # 注意：DeepSeek 已退役 deepseek-chat / deepseek-v4-flash，
+        # 现在写 deepseek-flash；改厂商只需改 .env 三行，不用动这里。
         from langchain_openai import ChatOpenAI
 
         api_key = os.getenv("LLM_API_KEY")

@@ -2,19 +2,34 @@
 
 ## 项目用途与本次学习目标
 
-Tutor-Chatbot 是一个苏格拉底式 CS 家教机器人：学生提问后，后端先判断"他想学什么、听懂了没有"，再按四级提示梯度（类比 → 收窄提示 → 引导提问 → 揭晓答案）用流式方式回答；学生上传 PDF 后，回答会基于 PDF 内容；提交代码时会调用 Judge0 真实执行。
+Tutor-Chatbot **原本**是一个苏格拉底式 CS 家教机器人：学生提问后，后端先判断"他想学什么、听懂了没有"，再按四级提示梯度（类比 → 收窄提示 → 引导提问 → 揭晓答案）用流式方式回答；学生上传 PDF 后，回答会基于 PDF 内容；提交代码时会调用 Judge0 真实执行。
+
+> **阅读提示（2026-10-04 更新）**：源码已经动过两轮，下面各课的部分行号与描述已过时。请以本提示为准：
+>
+> | 已改动 | 原文描述 | 现在的事实 |
+> |---|---|---|
+> | Judge0 代码执行 | 第 1 课第 7 关"顺序是：代码执行（235-251）→…" | `agent/tools.py` 已删除，`event_stream()` 开头不再有执行分支；行号整体前移 |
+> | 苏格拉底基调 | 第 1 课 `reveal_instruction`（281-285）"Do NOT give the direct answer." | 该变量已删除。`app.py` 的提示改为讲解式：允许直接给答案，规则里明确"不需要反问、不需要启发式铺垫" |
+> | 四级策略语义 | 第 1/2 课"类比 → 收窄提示 → 引导提问 → 揭晓答案" | `HINT_STRATEGIES` 已改为**讲解深度**四层：0 一句话结论 / 1 面试标准答案 / 2 原理展开 / 3 举例+面试追问。提示词改为中文 |
+> | RAG 引用规则 | 第 1 课"英文的 `RAG_GROUNDING_RULES`" | 已改为中文知识库规则，证据标签由 `PDF evidence:` 改为 `知识库资料：` |
+> | Prompt 模板 | 第 2 课提到的 `prompts.py` 五个模板 | `RESPOND_PROMPT` / `CONGRATS_PROMPT` / `UNKNOWN_TOPIC_PROMPT` 三个死代码已删除；`EXTRACT_TOPIC_PROMPT`、`ASSESS_UNDERSTANDING_PROMPT` 已中文化 + 八股化 |
+> | 模型通道 | `.env` 走智谱 GLM | 改为 DeepSeek：`LLM_BASE_URL=https://api.deepseek.com`、`LLM_MODEL=deepseek-flash` |
+>
+> 图（`graph.py`）本身**一行未改**——这正是第 2 课"分层是好事"的结论：换策略表和提示词不需要动状态机。
 
 本次学习目标：把这套开源后端改造成 **AI Classroom**（一个教室 + 计算机八股学科 + 学生画像 + 教师资源生成）。因此课程按"哪些能直接复用、哪些必须改、哪些要删"来组织，读者定位是**后端与 AI 算法负责人**。
 
 ## 源码版本与本地改动
 
-- 源码来自 GitHub 下载包，`Tutor-Chatbot-main/` 目录下**没有 git 仓库**，无法给出 commit 号；如需版本锚点，建议先 `git init` 并做一次初始提交再开始改造。
+- 源码来自 GitHub 下载包，`Tutor-Chatbot-main/` 目录下**没有 git 仓库**，无法给出 commit 号 → **已在 `D:\STUDY\AI-Classroom`（项目根目录）建 git 仓库并做基线提交 `b41483c`，改造前务必先提交**。
 - 本地已产生的改动：
   - 新建 `backend/venv/`，依赖按 `backend/requirements.txt` 安装完成（已追加 `langchain-openai`）。
-  - 新建 `backend/.env`：走新增的通用 OpenAI 兼容通道（`LLM_PROVIDER=openai`、`LLM_BASE_URL=https://open.bigmodel.cn/api/paas/v4`、`LLM_MODEL=glm-4.7-flash`），`LLM_API_KEY` 留空待填，其余沿用 `env.example` 的上传与会话限制。
-  - 代码改动仅两处：`agent/graph.py` 新增 openai 分支、`agent/state.py` 的 provider 白名单加入 `openai` 并设为默认值（详见第 3 课）。
+  - 新建 `backend/.env`：走新增的通用 OpenAI 兼容通道，当前指向 DeepSeek（`LLM_PROVIDER=openai`、`LLM_BASE_URL=https://api.deepseek.com`、`LLM_MODEL=deepseek-flash`），`LLM_API_KEY` 留空待填。换厂商只改这三行，不用动代码。
+  - 代码改动：`agent/graph.py` 新增 openai 分支（含 `DEFAULT_MODELS`）、`agent/state.py` 的 provider 白名单加入 `openai` 并设为默认值（详见第 3 课）。
+  - **已完成两次业务改造**：① 删除 Judge0 代码执行链路（含 `tools.py`）；② 提示基调由苏格拉底式改为中文八股讲解式（策略表、提示词、引用规则全部中文化）。
   - 后端已在 `127.0.0.1:8000` 跑起来，`GET /health` 返回 200。
 - 尚未填入可用的 API Key，因此 `/chat` 目前返回 **503**（`get_llm` 抛 `ValueError` 被转成 HTTP 503），属预期，见第 1 课"失败出口"。
+- **测试基线**：`python run_tests.py`（`backend/` 下）→ `Ran 16 tests, FAILURES=0, ERRORS=0`。每次改完必跑，数字不能掉。
 
 ## 前置基础
 
