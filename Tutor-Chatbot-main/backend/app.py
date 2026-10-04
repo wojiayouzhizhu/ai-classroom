@@ -20,7 +20,6 @@ from agent.graph import assessment_graph, get_llm, get_model
 from agent.rag.indexer import build_index
 from agent.rag.retriever import get_relevant_context
 from agent.state import ChatRequest, HistoryMessage, HINT_STRATEGIES, TutorState
-from agent.tools import contains_code, detect_language, execute_code, extract_code
 
 load_dotenv()
 
@@ -231,25 +230,6 @@ async def chat(request: Request, body: ChatRequest):
 
     async def event_stream():
         try:
-            asking_for_output = False
-            if contains_code(body.message):
-                code = extract_code(body.message)
-                language = detect_language(code)
-                code_output = await execute_code(code, language)
-                asking_for_output = any(
-                    phrase in body.message.lower()
-                    for phrase in [
-                        "what is the output",
-                        "what will this output",
-                        "what does this print",
-                        "what is the result",
-                        "run this",
-                        "execute this",
-                    ]
-                )
-            else:
-                code_output = ""
-
             strategy = HINT_STRATEGIES[assessment_state["hint_level"]]
             misconception_note = (
                 "The student's specific misconception is: "
@@ -257,18 +237,6 @@ async def chat(request: Request, body: ChatRequest):
                 if assessment_state["misconception"]
                 else "You don't yet know their specific misconception."
             )
-
-            if code_output:
-                if asking_for_output:
-                    misconception_note += (
-                        "\n\nThe student directly asked for the output. The code "
-                        f"produced:\n{code_output}\nGive them this output directly."
-                    )
-                else:
-                    misconception_note += (
-                        "\n\nThe student's code produced this result:\n"
-                        f"{code_output}\nUse it to give accurate feedback."
-                    )
 
             if assessment_state["resolved"]:
                 system_content = (
