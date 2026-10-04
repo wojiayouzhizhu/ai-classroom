@@ -22,7 +22,9 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from db.models import (  # noqa: E402
     Classroom,
     ClassroomMember,
+    LearningBehavior,
     Message,
+    StudentProfile,
     User,
 )
 from db.session import Base, DATABASE_URL  # noqa: E402
@@ -120,11 +122,20 @@ def verify() -> None:
     names = sorted(r[0] for r in rows)
     print("\nMySQL 中实际存在的表：", names)
 
-    expected = {"users", "classrooms", "classroom_members", "messages"}
+    # 导入即注册：create_all 只认已经被 import 过的模型类，
+    # 新增表忘了在这里登记，表就不会被建出来（代码里却能用，伪成功）。
+    expected = {
+        "users",
+        "classrooms",
+        "classroom_members",
+        "messages",
+        "student_profiles",
+        "learning_behaviors",
+    }
     missing = expected - set(names)
     if missing:
         raise SystemExit(f"以下表未创建成功：{sorted(missing)}")
-    print("四张核心表全部就绪 ✓")
+    print("六张表全部就绪 ✓")
 
 
 def main() -> None:

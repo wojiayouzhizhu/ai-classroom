@@ -132,6 +132,50 @@ Tutor-Chatbot **原本**是一个苏格拉底式 CS 家教机器人：学生提�
 
 **留给 T5 的**：`misconception` 每轮都算出来却用完即弃，它才是 StudentProfile 薄弱点的原材料——T5 做画像时按知识点累积落库。
 
+## T5 学生画像（2026-10-04 完成）
+
+**先修了两个挡路的 bug，否则画像拿不到原材料。**
+
+**Bug 1：`misconception` 一直是空字符串，不是模型填不出来。** 排查方法：拿同一句「死锁不就是进程死循环卡住了嘛」做对照，A 组不回传 topic、B 组回传 `topic=死锁`：
+
+| 组 | hint_level | misconception |
+|---|---|---|
+| 不回传 topic | 0 | `''` |
+| 回传 topic=死锁 | 1 | `把死锁误解为进程死循环卡住，而忽略其本质是多个进程互相等待…` |
+
+结论是 `assess_understanding_node` 开头的**两道短路**把评估整个跳过了：`topic_changed` 短路 + `len(messages) < 2` 短路。而学生带着错误理解来提问的**第一轮**，必然同时命中这两条——恰恰是最该记录的时刻。现在改成：换话题只把 `hint_level` 归零，误解照样记；也不再要求至少两轮消息才能评估。
+
+**Bug 2：`.env` 靠工作目录加载，换目录启动就静默降级。** `load_dotenv()` 无参数时只找 cwd，用 `uvicorn --app-dir` 从别的目录启动时会读不到配置，`/health` 会退化成 `provider=groq / database=disabled`——**不报错、不落库，极难排查**。现在 `app.py`、`agent/graph.py`、`db/session.py` 三处都改成按 `__file__` 定位 `.env`。注意 `app.py` 必须在 import `db.session` **之前**加载：session 在模块级就建 engine。
+
+**新增两张表**（都在「学生 × 课堂」粒度上，不跨课堂污染）：
+
+- `student_profiles`：`overall_level`、`learning_preference`、`knowledge_mastery`(JSON: 知识点→0~1)、`weak_points`(JSON 数组)
+- `learning_behaviors`：行为流水 `ask_question` / `repeat_question` / `request_explanation` / `mastered`
+
+**画像怎么算出来的（`agent/profiler.py`，确定性规则，不再额外调 LLM）**：
+
+| 信号 | 掌握度变化 |
+|---|---|
+| `resolved=true` | +0.3 |
+| `hint_level=2` | −0.1 |
+| `hint_level=3` | −0.2 |
+| `hint_level=0/1` | 0（刚开口，不奖不罚） |
+
+新知识点从 **0.5** 起步，代表「还没测出来」而不是「半懂」。定级规则：均值 ≥0.75 **且至少 2 个知识点**才给 advanced（只问一个、答得再好也不足以说明整体水平），≥0.4 为 intermediate，否则 beginner。
+
+**topic 必须归一**：topic 是模型自由抽取的，「TCP 三次握手」和「tcp三次握手」不归一就会在画像里裂成两个键，学生问三遍还是 beginner。`normalize_topic()` 去掉全部空白并转小写。
+
+**验收**（`python smoke_profile.py`，8 次真实对话）：
+
+| 学生 | 对话 | 结果 |
+|---|---|---|
+| A | 带错误说法进场 → 连追三轮不懂 | `beginner`，`死锁=0.0`，3 条薄弱点，偏好「需要把原理展开」 |
+| B | 两个知识点都当场答对 | `advanced`，`tcp三次握手=0.8`、`进程与线程的区别=0.8` |
+
+行为流水 `['repeat_question', 'request_explanation', 'request_explanation', 'ask_question']` 四种齐了。`PUT /students/{id}/profile` 手工写入 `HashMap=0.3/JVM=0.2` 与 `0.8/0.9` 后自动定级 beginner / advanced。新增 `tests/test_profiler.py` 22 个用例，`run_tests.py` **38/38**。
+
+**留给 T6 的**：画像现在只是「存下来了」，还没被喂回提示词。T6 要做的就是把 `overall_level` + 当前知识点的 `knowledge_mastery` + `weak_points` 拼进 `system_content`，让 beginner 和 advanced 拿到不同深度的讲解。
+
 ## 前置基础
 
 - Python 异步（`async/await`、`asyncio.to_thread`）

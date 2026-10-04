@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import os
 from contextlib import contextmanager
+from pathlib import Path
 from typing import Iterator
 
 from sqlalchemy import create_engine, text
@@ -17,10 +18,15 @@ from sqlalchemy.orm import DeclarativeBase, sessionmaker
 
 # 独立脚本（init_db.py / seed_demo.py）不走 app.py，这里兜底加载一次 .env，
 # 保证任何入口 import db 都能读到 MYSQL_* 配置。重复调用无副作用。
+#
+# 必须按文件路径加载而不是依赖当前工作目录：本模块在 import 时就要读
+# MYSQL_* 并建 engine，一旦从别的目录启动（uvicorn --app-dir、定时任务、
+# 别的进程拉起），cwd 找不到 .env，服务就会静默退化成「无数据库」模式——
+# 不报错、不落库，很难查。
 try:
     from dotenv import load_dotenv
 
-    load_dotenv()
+    load_dotenv(Path(__file__).resolve().parent.parent / ".env")
 except ImportError:  # pragma: no cover
     pass
 

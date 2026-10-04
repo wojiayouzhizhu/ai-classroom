@@ -1,5 +1,6 @@
 import json
 import os
+from pathlib import Path
 
 from dotenv import load_dotenv
 from langchain_core.messages import HumanMessage
@@ -11,7 +12,8 @@ from .state import TutorState
 
 from .prompts import EXTRACT_TOPIC_PROMPT, ASSESS_UNDERSTANDING_PROMPT
 
-load_dotenv()
+# 按文件位置加载，不依赖当前工作目录（理由见 db/session.py 的同款注释）
+load_dotenv(Path(__file__).resolve().parent.parent / ".env")
 
 DEFAULT_MODELS = {
     "ollama": "llama3.2",
@@ -151,14 +153,19 @@ async def extract_topic_node(state: TutorState) -> dict:
 
 
 async def assess_understanding_node(state: TutorState) -> dict:
-    if state.get("topic_changed", False):
-        return {"hint_level": 0, "misconception": "", "resolved": False}
+    # 换话题时不再整体短路。
+    # 原来的写法一遇到 topic_changed 就 return 空 misconception、hint_level=0，
+    # 结果学生带着错误理解来提问的「第一轮」（"死锁就是进程死循环吧？"）
+    # 永远抓不到误解——而那正是学生画像最值钱的原材料。
+    # 现在换话题只把讲解深度归零，误解照样记下来。
+    topic_changed = state.get("topic_changed", False)
 
     if state["topic"] == "unknown":
         return {"hint_level": 0, "misconception": "", "resolved": False}
 
-    if len(state["messages"]) < 2:
-        return {"hint_level": 0, "misconception": "", "resolved": False}
+    # 不再要求「至少两轮」才评估：学生的第一句话里经常就带着误解
+    # （"死锁不就是进程死循环卡住了嘛"），那是最该记进画像的信号，
+    # 用消息条数把它挡掉等于每次都要等学生错第二轮才发现。
 
     history_text = "\n".join(
         f"{'User' if isinstance(m, HumanMessage) else 'Tutor'}: {m.content}"
@@ -174,6 +181,13 @@ async def assess_understanding_node(state: TutorState) -> dict:
 
     try:
         assessment = parse_assessment_result(response.content)
+
+        if topic_changed:
+            return {
+                "resolved": False,
+                "hint_level": 0,
+                "misconception": assessment.misconception,
+            }
 
         if assessment.resolved:
             return {

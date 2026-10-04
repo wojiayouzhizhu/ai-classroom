@@ -11,6 +11,12 @@ import uuid
 
 from dotenv import load_dotenv
 from fastapi import FastAPI, File, HTTPException, Request, UploadFile
+
+# .env 必须在下面这些 import 之前加载：`db.session` 在模块级就读取 MYSQL_*
+# 并建 engine，晚一步服务会静默退化成「无数据库」模式。
+# 按文件路径加载而不是靠 cwd——从别的目录启动（uvicorn --app-dir）时
+# cwd 里根本没有 .env。
+load_dotenv(Path(__file__).resolve().parent / ".env")  # noqa: E402
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import Response, StreamingResponse
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage
@@ -20,12 +26,13 @@ from slowapi.errors import RateLimitExceeded
 from slowapi.util import get_remote_address
 
 from agent.graph import assessment_graph, get_llm, get_model
+from agent.profiler import apply_turn, derive_level, get_or_create_profile, profile_to_dict
 from agent.rag.indexer import build_index, load_knowledge_index
 from agent.rag.retriever import get_knowledge_context, get_relevant_context
 from agent.state import ChatRequest, HistoryMessage, HINT_STRATEGIES, TutorState
 from sqlalchemy import select
 
-from db.models import Classroom, ClassroomMember, User
+from db.models import Classroom, ClassroomMember, LearningBehavior, StudentProfile, User
 from db.repository import (
     add_member,
     create_classroom,
@@ -37,8 +44,6 @@ from db.repository import (
     save_message,
 )
 from db.session import SessionLocal, db_available, get_db
-
-load_dotenv()
 
 MAX_UPLOAD_BYTES = max(
     1,
@@ -167,6 +172,42 @@ def _persist_assistant(
                 )
     except Exception as exc:
         print(f"[db] 助手回复落库失败（忽略）：{exc}", flush=True)
+
+
+def _update_profile(
+    classroom_id: int | None,
+    user_id: int | None,
+    topic: str,
+    hint_level: int,
+    misconception: str,
+    resolved: bool,
+    prev_topic: str,
+    prev_hint_level: int,
+) -> None:
+    """一轮对话结束后沉淀画像。
+
+    prev_topic / prev_hint_level 是「进入这一轮之前」的状态——DB 路径下
+    已由 load_last_state 恢复，正好用来判断学生是换了知识点还是要求展开。
+    画像只是副产品，出错一律记日志放过，不能把已经流出去的回答变成错误。
+    """
+    if classroom_id is None or user_id is None:
+        return
+    try:
+        with get_db() as db:
+            if db is not None:
+                apply_turn(
+                    db,
+                    user_id,
+                    classroom_id,
+                    topic=topic,
+                    hint_level=hint_level,
+                    misconception=misconception,
+                    resolved=resolved,
+                    prev_topic=prev_topic,
+                    prev_hint_level=prev_hint_level,
+                )
+    except Exception as exc:
+        print(f"[db] 画像更新失败（忽略）：{exc}", flush=True)
 
 
 def add_rag_grounding(prompt: str, rag_context: str) -> str:
@@ -396,6 +437,18 @@ async def chat(request: Request, body: ChatRequest):
                 assessment_state["topic"],
                 assessment_state["hint_level"],
             )
+            # 画像沉淀必须在「落库回答」之后：它依赖本轮最终的
+            # topic / hint_level / resolved，早一步读到的还是旧状态。
+            _update_profile(
+                classroom_id,
+                body.user_id,
+                topic=assessment_state["topic"],
+                hint_level=assessment_state["hint_level"],
+                misconception=assessment_state["misconception"],
+                resolved=assessment_state["resolved"],
+                prev_topic=body.topic,
+                prev_hint_level=body.hint_level,
+            )
             yield (
                 "data: "
                 f"{json.dumps({'type': 'state', 'topic': assessment_state['topic'], 'hint_level': assessment_state['hint_level'], 'misconception': assessment_state['misconception'], 'resolved': assessment_state['resolved']})}\n\n"
@@ -538,9 +591,7 @@ def api_get_classroom(classroom_id: int):
             "subject": room.subject,
             "description": room.description,
         }
-
-
-@app.get("/classrooms/{classroom_id}/members")
+    return result
 def api_list_members(classroom_id: int):
     """课堂成员：Teacher / Student。
 
@@ -575,6 +626,120 @@ def api_list_members(classroom_id: int):
             ],
         }
     return result
+
+
+# --- T5：学生画像 ---------------------------------------------------------
+# 画像是每轮对话自动沉淀的（见 agent/profiler.py），这里的接口负责
+# 「读出来给人看」和「让人手工修正」两件事。
+
+
+class UpdateProfileRequest(BaseModel):
+    """手工修正画像。
+
+    只覆盖传了的字段，没传的保持原样。注意：手工改完并不会锁死——
+    下一轮对话仍会按新证据继续更新，这是画像而不是配置。
+    """
+
+    classroom_id: int
+    overall_level: Literal["beginner", "intermediate", "advanced"] | None = None
+    learning_preference: str | None = None
+    knowledge_mastery: dict[str, float] | None = None
+    weak_points: list[str] | None = None
+
+
+@app.get("/students/{user_id}/profile")
+def api_get_profile(user_id: int, classroom_id: int | None = None):
+    """读画像。给了 classroom_id 返回单个，不给返回该学生全部课堂的画像。"""
+    _require_db()
+    with get_db() as db:
+        if db.get(User, user_id) is None:
+            raise HTTPException(
+                status_code=404, detail=f"User {user_id} not found."
+            )
+        query = select(StudentProfile).where(StudentProfile.user_id == user_id)
+        if classroom_id is not None:
+            query = query.where(StudentProfile.classroom_id == classroom_id)
+        rows = db.execute(query).scalars().all()
+        result = [profile_to_dict(r) for r in rows]
+
+    if classroom_id is not None:
+        if not result:
+            raise HTTPException(
+                status_code=404,
+                detail=f"No profile for user {user_id} in classroom {classroom_id}.",
+            )
+        return result[0]
+    return {"user_id": user_id, "count": len(result), "profiles": result}
+
+
+@app.put("/students/{user_id}/profile")
+def api_update_profile(user_id: int, body: UpdateProfileRequest):
+    _require_db()
+    with get_db() as db:
+        if db.get(User, user_id) is None:
+            raise HTTPException(
+                status_code=404, detail=f"User {user_id} not found."
+            )
+        if db.get(Classroom, body.classroom_id) is None:
+            raise HTTPException(
+                status_code=404,
+                detail=f"Classroom {body.classroom_id} not found.",
+            )
+
+        profile = get_or_create_profile(db, user_id, body.classroom_id)
+
+        if body.overall_level is not None:
+            profile.overall_level = body.overall_level
+        if body.learning_preference is not None:
+            profile.learning_preference = body.learning_preference
+        if body.knowledge_mastery is not None:
+            # 掌握度定义在 0~1，手工写超范围会给 T6 的分级逻辑喂脏数据
+            profile.knowledge_mastery = {
+                topic: round(min(1.0, max(0.0, float(score))), 2)
+                for topic, score in body.knowledge_mastery.items()
+            }
+        if body.weak_points is not None:
+            profile.weak_points = body.weak_points
+
+        # 手工改了掌握度就要重新定级，否则会出现「 mastery 全 0.9 但
+        # 还挂着 beginner」这种自相矛盾的画像。
+        if body.knowledge_mastery is not None and body.overall_level is None:
+            profile.overall_level = derive_level(profile.knowledge_mastery)
+
+        db.flush()
+        result = profile_to_dict(profile)
+    return result
+
+
+@app.get("/students/{user_id}/behaviors")
+def api_list_behaviors(
+    user_id: int, classroom_id: int | None = None, limit: int = 50
+):
+    """学习行为流水：画像里那些结论的推导依据。"""
+    _require_db()
+    limit = max(1, min(limit, 500))
+    with get_db() as db:
+        if db.get(User, user_id) is None:
+            raise HTTPException(
+                status_code=404, detail=f"User {user_id} not found."
+            )
+        query = select(LearningBehavior).where(LearningBehavior.user_id == user_id)
+        if classroom_id is not None:
+            query = query.where(LearningBehavior.classroom_id == classroom_id)
+        rows = db.execute(query.order_by(LearningBehavior.id.desc()).limit(limit))
+        rows = rows.scalars().all()
+        result = [
+            {
+                "id": b.id,
+                "classroom_id": b.classroom_id,
+                "topic": b.topic,
+                "action": b.action,
+                "hint_level": b.hint_level,
+                "created_at": b.created_at.isoformat() if b.created_at else None,
+            }
+            for b in rows
+        ]
+    return {"user_id": user_id, "count": len(result), "behaviors": result}
 
 
 @app.post("/upload")
