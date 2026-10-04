@@ -45,3 +45,7 @@ class ChatRequest(BaseModel):
     history: List[HistoryMessage] = Field(default_factory=list, max_length=50)
     session_id: str = Field(default="", max_length=36)
     provider: Literal["ollama", "groq", "gemini", "openai"] = "openai"
+    # T3：持久化定位。都留空时 /chat 退化为「不落库」的旧行为，
+    # 保证现有前端（只传 session_id）不被破坏。
+    classroom_id: int | None = None
+    user_id: int | None = None

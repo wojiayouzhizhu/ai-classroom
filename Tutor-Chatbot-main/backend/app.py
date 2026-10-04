@@ -6,7 +6,7 @@ from functools import lru_cache
 from pathlib import Path
 import tempfile
 import time
-from typing import List
+from typing import List, Literal
 import uuid
 
 from dotenv import load_dotenv
@@ -14,6 +14,7 @@ from fastapi import FastAPI, File, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import Response, StreamingResponse
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage
+from pydantic import BaseModel, Field
 from slowapi import Limiter, _rate_limit_exceeded_handler
 from slowapi.errors import RateLimitExceeded
 from slowapi.util import get_remote_address
@@ -22,6 +23,16 @@ from agent.graph import assessment_graph, get_llm, get_model
 from agent.rag.indexer import build_index, load_knowledge_index
 from agent.rag.retriever import get_knowledge_context, get_relevant_context
 from agent.state import ChatRequest, HistoryMessage, HINT_STRATEGIES, TutorState
+from db.models import Classroom, User
+from db.repository import (
+    add_member,
+    create_classroom,
+    create_user,
+    list_messages,
+    load_history,
+    save_message,
+)
+from db.session import SessionLocal, db_available, get_db
 
 load_dotenv()
 
@@ -126,6 +137,27 @@ def deserialize_history(
     return messages
 
 
+def _classroom_of(body: ChatRequest) -> int | None:
+    """本次请求是否要落库：只有传了 classroom_id 且数据库已配置才算。
+
+    返回 classroom_id 或 None。旧前端只传 session_id 时返回 None，
+    走原来的纯内存路径，行为完全不变。
+    """
+    return body.classroom_id if (body.classroom_id and SessionLocal) else None
+
+
+def _persist_assistant(classroom_id: int | None, answer: str) -> None:
+    """把助手回复落库。落库失败绝不能影响已经发出的回答。"""
+    if classroom_id is None or not answer.strip():
+        return
+    try:
+        with get_db() as db:
+            if db is not None:
+                save_message(db, classroom_id, None, "assistant", answer)
+    except Exception as exc:
+        print(f"[db] 助手回复落库失败（忽略）：{exc}", flush=True)
+
+
 def add_rag_grounding(prompt: str, rag_context: str) -> str:
     if not rag_context:
         return prompt
@@ -147,7 +179,22 @@ async def chat(request: Request, body: ChatRequest):
 
     await asyncio.to_thread(cleanup_expired_sessions)
 
+    classroom_id = _classroom_of(body)
     history = deserialize_history(body.history)
+
+    # 落在课堂里时，历史以数据库为准（刷新页面也不会丢），
+    # 并先把学生这条提问存下来——注意顺序：先读历史再存，避免本条被重复计入。
+    if classroom_id is not None:
+        try:
+            with get_db() as db:
+                if db is not None:
+                    db_history = load_history(db, classroom_id)
+                    if db_history:
+                        history = deserialize_history(db_history)
+                    save_message(db, classroom_id, body.user_id, "student", body.message)
+        except Exception as exc:
+            print(f"[db] 读取历史/落库用户消息失败（改用前端历史）：{exc}", flush=True)
+
     new_message = HumanMessage(content=body.message)
 
     initial_state: TutorState = {
@@ -193,6 +240,7 @@ async def chat(request: Request, body: ChatRequest):
 
             async def doc_stream():
                 try:
+                    answer_parts: list[str] = []
                     prompt = add_rag_grounding(
                         (
                             "你是计算机八股辅导助手。依据下面给出的知识库资料，"
@@ -205,10 +253,12 @@ async def chat(request: Request, body: ChatRequest):
                     async for chunk in llm.astream([HumanMessage(content=prompt)]):
                         token = chunk.content
                         if token:
+                            answer_parts.append(str(token))
                             yield (
                                 "data: "
                                 f"{json.dumps({'type': 'token', 'content': token})}\n\n"
                             )
+                    _persist_assistant(classroom_id, "".join(answer_parts))
                     yield (
                         "data: "
                         f"{json.dumps({'type': 'state', 'topic': '', 'hint_level': 0, 'misconception': '', 'resolved': False})}\n\n"
@@ -224,6 +274,7 @@ async def chat(request: Request, body: ChatRequest):
 
         async def unknown_stream():
             try:
+                answer_parts: list[str] = []
                 prompt = (
                     "你是计算机八股（面试知识点）辅导助手。学生还没说想学什么。"
                     "用中文简短打个招呼，并请他告诉你想了解哪个计算机知识点，"
@@ -232,10 +283,12 @@ async def chat(request: Request, body: ChatRequest):
                 async for chunk in llm.astream([HumanMessage(content=prompt)]):
                     token = chunk.content
                     if token:
+                        answer_parts.append(str(token))
                         yield (
                             "data: "
                             f"{json.dumps({'type': 'token', 'content': token})}\n\n"
                         )
+                _persist_assistant(classroom_id, "".join(answer_parts))
                 yield (
                     "data: "
                     f"{json.dumps({'type': 'state', 'topic': '', 'hint_level': 0, 'misconception': '', 'resolved': False})}\n\n"
@@ -301,14 +354,17 @@ async def chat(request: Request, body: ChatRequest):
                     *assessment_state["messages"],
                 ]
 
+            answer_parts: list[str] = []
             async for chunk in llm.astream(messages):
                 token = chunk.content
                 if token:
+                    answer_parts.append(str(token))
                     yield (
                         "data: "
                         f"{json.dumps({'type': 'token', 'content': token})}\n\n"
                     )
 
+            _persist_assistant(classroom_id, "".join(answer_parts))
             yield (
                 "data: "
                 f"{json.dumps({'type': 'state', 'topic': assessment_state['topic'], 'hint_level': assessment_state['hint_level'], 'misconception': assessment_state['misconception'], 'resolved': assessment_state['resolved']})}\n\n"
@@ -326,10 +382,111 @@ async def chat(request: Request, body: ChatRequest):
 @app.get("/health")
 def health():
     provider = os.getenv("LLM_PROVIDER", "groq")
+    if SessionLocal is None:
+        db_state = "disabled"
+    else:
+        db_state = "up" if db_available() else "down"
     return {
         "status": "ok",
         "provider": provider,
         "model": get_model(provider),
+        "database": db_state,
+    }
+
+
+# --- T3：用户 / 课堂 / 成员 / 聊天记录 的最小 HTTP 端点 -------------------
+# 只覆盖 T3.6 验收要求的四项能力，成员身份校验等语义留给 T4。
+
+
+class CreateUserRequest(BaseModel):
+    username: str = Field(..., min_length=1, max_length=64)
+    role: Literal["student", "teacher"] = "student"
+
+
+class CreateClassroomRequest(BaseModel):
+    name: str = Field(..., min_length=1, max_length=128)
+    subject: str = Field(default="cs", max_length=64)
+    description: str | None = None
+
+
+class AddMemberRequest(BaseModel):
+    user_id: int
+    role: Literal["student", "teacher"] = "student"
+
+
+def _require_db():
+    if SessionLocal is None:
+        raise HTTPException(
+            status_code=503,
+            detail="Database is not configured. Fill MYSQL_* in backend/.env.",
+        )
+
+
+@app.post("/users", status_code=201)
+def api_create_user(body: CreateUserRequest):
+    _require_db()
+    with get_db() as db:
+        user = create_user(db, body.username, body.role)
+        result = {"id": user.id, "username": user.username, "role": user.role}
+    return result
+
+
+@app.post("/classrooms", status_code=201)
+def api_create_classroom(body: CreateClassroomRequest):
+    _require_db()
+    with get_db() as db:
+        room = create_classroom(db, body.name, body.subject, body.description)
+        result = {
+            "id": room.id,
+            "name": room.name,
+            "subject": room.subject,
+            "description": room.description,
+        }
+    return result
+
+
+@app.post("/classrooms/{classroom_id}/members", status_code=201)
+def api_add_member(classroom_id: int, body: AddMemberRequest):
+    _require_db()
+    with get_db() as db:
+        # 先确认课堂和用户存在，否则外键约束会变成一句看不懂的 500
+        if db.get(Classroom, classroom_id) is None:
+            raise HTTPException(
+                status_code=404, detail=f"Classroom {classroom_id} not found."
+            )
+        if db.get(User, body.user_id) is None:
+            raise HTTPException(
+                status_code=404, detail=f"User {body.user_id} not found."
+            )
+        member = add_member(db, classroom_id, body.user_id, body.role)
+        result = {
+            "id": member.id,
+            "classroom_id": member.classroom_id,
+            "user_id": member.user_id,
+            "role": member.role,
+        }
+    return result
+
+
+@app.get("/classrooms/{classroom_id}/messages")
+def api_list_messages(classroom_id: int, limit: int = 100):
+    _require_db()
+    limit = max(1, min(limit, 500))
+    with get_db() as db:
+        rows = list_messages(db, classroom_id, limit)
+    return {
+        "classroom_id": classroom_id,
+        "count": len(rows),
+        "messages": [
+            {
+                "id": m.id,
+                "user_id": m.user_id,
+                "role": m.role,
+                "content": m.content,
+                "created_at": m.created_at.isoformat() if m.created_at else None,
+            }
+            for m in rows
+        ],
     }
 
 

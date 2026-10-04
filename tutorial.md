@@ -26,7 +26,7 @@ Tutor-Chatbot **原本**是一个苏格拉底式 CS 家教机器人：学生提�
   - 新建 `backend/venv/`，依赖按 `backend/requirements.txt` 安装完成（已追加 `langchain-openai`）。
   - 新建 `backend/.env`：走新增的通用 OpenAI 兼容通道，当前指向 DeepSeek（`LLM_PROVIDER=openai`、`LLM_BASE_URL=https://api.deepseek.com`、`LLM_MODEL=deepseek-flash`），`LLM_API_KEY` 留空待填。换厂商只改这三行，不用动代码。
   - 代码改动：`agent/graph.py` 新增 openai 分支（含 `DEFAULT_MODELS`）、`agent/state.py` 的 provider 白名单加入 `openai` 并设为默认值（详见第 3 课）。
-  - **已完成三次改造**：① 删除 Judge0 代码执行链路（含 `tools.py`）；② 提示基调由苏格拉底式改为中文八股讲解式（策略表、提示词、引用规则全部中文化）；③ T2 八股知识库（8 篇文档 + 中文 embedding + 常驻 Chroma，详见下文 T2 小节）。
+  - **已完成四次改造**：① 删除 Judge0 代码执行链路（含 `tools.py`）；② 提示基调由苏格拉底式改为中文八股讲解式（策略表、提示词、引用规则全部中文化）；③ T2 八股知识库（8 篇文档 + 中文 embedding + 常驻 Chroma，详见下文 T2 小节）；④ T3 MySQL 持久化（四张核心表 + `/chat` 落库，详见下文 T3 小节）。
   - 后端已在 `127.0.0.1:8000` 跑起来，`GET /health` 返回 200。
 - **T0.2 已验收通过（2026-10-04）**：`LLM_API_KEY` 已填入 DeepSeek key，`/chat` 真实跑通。四轮实测结果见下表。
 - **两个验收入口**（都在 `backend/` 下用 venv 的 python 跑）：
@@ -72,6 +72,39 @@ Tutor-Chatbot **原本**是一个苏格拉底式 CS 家教机器人：学生提�
 3. **Chroma 持久化是追加语义**：重复构建会翻倍（66 → 132）。`build_kb.py` 里已经加了 `drop_collection()` 保证幂等。
 
 **验收**：`python build_kb.py` → 66 切片；三个测试问题（TCP 三次握手 / 死锁必要条件 / 进程与线程区别）回答均直接命中知识库内容，表格与措辞一致。
+
+## T3 MySQL 持久化（2026-10-04 完成）
+
+**本机环境**：MySQL 8.0.41（`C:\Program Files\MySQL\MySQL Server 8.0`），root 密码 `123456`，库名 `ai_classroom`，可用 Navicat 查看。
+
+**四张核心表**（字段严格按 DEVELOPMENT.md 第 6 节，未提前加 StudentProfile / LearningRecord）：
+
+| 表 | 关键设计 |
+|---|---|
+| `users` | `username` 唯一；`role` ∈ student/teacher |
+| `classrooms` | `subject` 默认 `cs` |
+| `classroom_members` | `(classroom_id, user_id)` 唯一约束，防止重复加入 |
+| `messages` | `role` ∈ student/assistant/teacher；**`user_id` 可空**——assistant 的回复不属于任何用户，强行造「AI 用户」会污染 User 表和角色语义 |
+
+**新增文件**：
+
+- `db/session.py`：engine 与 `SessionLocal`。**数据库是可选的**——`MYSQL_*` 没配时 engine 为 None，服务以「无数据库」模式照常运行，避免本地没起 MySQL 就整个起不来。两个关键参数：`pool_pre_ping=True`（MySQL 默认 8 小时断连）、`expire_on_commit=False`（见下）。
+- `db/models.py`：四张表的 ORM 模型。
+- `db/repository.py`：数据访问函数。`load_history()` 先按 `id.desc()` 取最近 N 条再反转——直接 `order_by(id).limit(n)` 拿到的是**最早**的 n 条，会把最近的对话截掉。
+- `init_db.py`：建库（utf8mb4）+ 建表 + 回读校验。
+- `seed_demo.py`：T3.6 五项验收（纯数据库层，不启服务也能跑）。
+- `smoke_db.py`：端到端验收（需服务在跑），与 `smoke_chat.py` 分工——前者带 `classroom_id` 验持久化，后者不带，验纯对话链路。
+
+**`app.py` 的接入**：`ChatRequest` 新增可选 `classroom_id` / `user_id`。两者都留空时退化为原来的不落库行为，**现有前端（只传 `session_id`）完全不受影响**。落库顺序是「先读历史再存本条」，否则刚存的用户消息会被自己读回来、和新消息重复。
+
+**两个真实踩到的坑**：
+
+1. **`DetachedInstanceError`**：`with get_db() as db` 退出时会 commit + close，commit 默认把实例属性标记为失效，之后在 with 外面读 `user.id` 就崩。修法是 `sessionmaker(expire_on_commit=False)`，同时端点在 with 内就把字段取成 dict。
+2. **追问被判成 `unknown`**（由持久化暴露）：`extract_topic_node` 原来**只把最后一条用户消息**喂给模型（`graph.py:105`），prompt 里虽带 `current_topic`，但一旦客户端没回传 topic（历史改成从库里读就是这种情况），「那怎么预防呢？」这种指代性追问就没有任何上下文，只能返回 unknown → 走去打招呼分支。修法是把最近 6 条对话一并给模型，并让 prompt 明确「当前知识点为 unknown 时，先从近期对话推断」。顺带修了第 2 课记下的隐患：`topic` 结果做 `.strip("。.！!？?；;，,、\"' ")`，模型多返回一个句号就会被当成换话题、把 hint_level 打回 0。
+
+**验收**：`python init_db.py` → 四张表就绪；`python seed_demo.py` → 五项通过；`python smoke_db.py` → 两轮对话 4 条记录，第 2 轮追问 `topic=死锁` 且回答接上上下文（资源有序分配法）。`run_tests.py` 仍 16/16。
+
+**留给 T4 的**：`topic` / `hint_level` 这些教学状态目前仍靠客户端回传，**没有落库**——所以刷新页面后虽然历史还在，但讲解深度会归零。T4 做「后端必须知道谁、在哪个课堂」时会一并解决（成员身份校验 + 教学状态持久化）。
 
 ## 前置基础
 

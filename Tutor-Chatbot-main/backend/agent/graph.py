@@ -104,9 +104,19 @@ async def extract_topic_node(state: TutorState) -> dict:
     user_messages = [m for m in state["messages"] if isinstance(m, HumanMessage)]
     latest_message = user_messages[-1].content
 
+    # 追问（"那怎么预防呢？""为什么？"）脱离上下文根本无法判断知识点。
+    # 只把最后一句话喂给模型是原来的 bug：一旦客户端没回传 topic
+    # （例如历史改成从数据库加载），所有追问都会被判成 unknown。
+    recent = state["messages"][-6:]
+    conversation = "\n".join(
+        f"{'User' if isinstance(m, HumanMessage) else 'Tutor'}: {m.content[:300]}"
+        for m in recent
+    ) or "（无）"
+
     current_topic = state["topic"] or "unknown"
     prompt = EXTRACT_TOPIC_PROMPT.format(
         current_topic=current_topic,
+        conversation=conversation,
         latest_message=latest_message,
     )
 
@@ -115,7 +125,9 @@ async def extract_topic_node(state: TutorState) -> dict:
     if result.lower() == "same":
         return {}
 
-    topic = result.lower()
+    # 模型偶尔会带个句号或引号返回（"死锁。"），不清掉就会被当成换了话题，
+    # 白白把 hint_level 打回 0。
+    topic = result.lower().strip().strip("。.！!？?；;，,、\"' ")
     if topic in ["unknown", "none", "no topic", "not mentioned"]:
         if current_topic != "unknown":
             return {}

@@ -18,3 +18,8 @@ httpx
 pypdf
 python-multipart
 fastembed
+
+# T3 MySQL 持久化
+sqlalchemy
+pymysql
+cryptography
