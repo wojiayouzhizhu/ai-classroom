@@ -57,9 +57,19 @@ def add_member(db, classroom_id: int, user_id: int, role: str) -> ClassroomMembe
 
 
 def save_message(
-    db, classroom_id: int, user_id: int | None, role: str, content: str
+    db,
+    classroom_id: int,
+    user_id: int | None,
+    role: str,
+    content: str,
+    topic: str | None = None,
+    hint_level: int = 0,
 ) -> Message | None:
-    """落一条消息。assistant 的回复 user_id 为 None。"""
+    """落一条消息。assistant 的回复 user_id 为 None。
+
+    topic / hint_level 只对 assistant 消息有意义：记录「这次回答讲的是
+    哪个知识点、讲到第几层」，下一次请求据此恢复状态。
+    """
     if db is None or not content:
         return None
     message = Message(
@@ -67,10 +77,57 @@ def save_message(
         user_id=user_id,
         role=role,
         content=content,
+        topic=topic,
+        hint_level=hint_level,
     )
     db.add(message)
     db.flush()
     return message
+
+
+def load_last_state(db, classroom_id: int) -> tuple[str, int]:
+    """取这个课堂最后一条「有效教学状态」。
+
+    服务端是状态的唯一真相源：只要落了 classroom_id，就不再信客户端
+    回传的 topic / hint_level，一律从这里恢复。这样刷新页面、换设备、
+    甚至前端压根不传状态，多轮讲解深度都不会断。
+    """
+    if db is None:
+        return "", 0
+    row = (
+        db.execute(
+            select(Message)
+            .where(
+                Message.classroom_id == classroom_id,
+                Message.topic.isnot(None),
+                Message.topic != "",
+            )
+            .order_by(Message.id.desc())
+            .limit(1)
+        )
+        .scalars()
+        .first()
+    )
+    if row is None:
+        return "", 0
+    return row.topic or "", row.hint_level or 0
+
+
+def is_member(db, classroom_id: int, user_id: int | None) -> bool:
+    """这个人是否真的在这个课堂里（T4.4：后端必须知道「谁」）。"""
+    if db is None or user_id is None:
+        return False
+    return (
+        db.execute(
+            select(ClassroomMember).where(
+                ClassroomMember.classroom_id == classroom_id,
+                ClassroomMember.user_id == user_id,
+            )
+        )
+        .scalars()
+        .first()
+        is not None
+    )
 
 
 def load_history(

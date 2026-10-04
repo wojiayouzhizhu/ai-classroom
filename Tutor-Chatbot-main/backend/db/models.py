@@ -121,6 +121,11 @@ class Message(Base):
     created_at: Mapped[dt.datetime] = mapped_column(
         DateTime, nullable=False, server_default=func.now()
     )
+    # T4：教学状态随消息落库。原来 topic / hint_level 只在客户端内存中，
+    # 刷新页面就归零、多轮递进断掉。现在每次回答把当时的知识点与讲解深度
+    # 一并写进来，下次请求从最后一条消息恢复——服务端成为状态的唯一真相源。
+    topic: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    hint_level: Mapped[int] = mapped_column(nullable=False, default=0)
 
     classroom: Mapped["Classroom"] = relationship(back_populates="messages")
     user: Mapped["User | None"] = relationship(back_populates="messages")

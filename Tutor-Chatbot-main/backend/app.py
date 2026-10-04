@@ -23,13 +23,17 @@ from agent.graph import assessment_graph, get_llm, get_model
 from agent.rag.indexer import build_index, load_knowledge_index
 from agent.rag.retriever import get_knowledge_context, get_relevant_context
 from agent.state import ChatRequest, HistoryMessage, HINT_STRATEGIES, TutorState
-from db.models import Classroom, User
+from sqlalchemy import select
+
+from db.models import Classroom, ClassroomMember, User
 from db.repository import (
     add_member,
     create_classroom,
     create_user,
+    is_member,
     list_messages,
     load_history,
+    load_last_state,
     save_message,
 )
 from db.session import SessionLocal, db_available, get_db
@@ -146,14 +150,21 @@ def _classroom_of(body: ChatRequest) -> int | None:
     return body.classroom_id if (body.classroom_id and SessionLocal) else None
 
 
-def _persist_assistant(classroom_id: int | None, answer: str) -> None:
-    """把助手回复落库。落库失败绝不能影响已经发出的回答。"""
+def _persist_assistant(
+    classroom_id: int | None,
+    answer: str,
+    topic: str = "",
+    hint_level: int = 0,
+) -> None:
+    """把助手回复连同当时的教学状态落库。落库失败绝不能影响已经发出的回答。"""
     if classroom_id is None or not answer.strip():
         return
     try:
         with get_db() as db:
             if db is not None:
-                save_message(db, classroom_id, None, "assistant", answer)
+                save_message(
+                    db, classroom_id, None, "assistant", answer, topic, hint_level
+                )
     except Exception as exc:
         print(f"[db] 助手回复落库失败（忽略）：{exc}", flush=True)
 
@@ -182,16 +193,31 @@ async def chat(request: Request, body: ChatRequest):
     classroom_id = _classroom_of(body)
     history = deserialize_history(body.history)
 
-    # 落在课堂里时，历史以数据库为准（刷新页面也不会丢），
-    # 并先把学生这条提问存下来——注意顺序：先读历史再存，避免本条被重复计入。
+    # 落在课堂里时：校验身份 → 恢复历史 → 恢复教学状态 → 存下本条提问。
+    # 顺序有讲究：先读历史和状态再存本条，否则刚存的消息会被自己读回来、
+    # 和新消息重复。
     if classroom_id is not None:
         try:
             with get_db() as db:
                 if db is not None:
+                    # T4.4：后端必须知道「谁」——不是这个课堂的成员一律拒绝
+                    if not is_member(db, classroom_id, body.user_id):
+                        raise HTTPException(
+                            status_code=403,
+                            detail=(
+                                f"User {body.user_id} is not a member of "
+                                f"classroom {classroom_id}."
+                            ),
+                        )
                     db_history = load_history(db, classroom_id)
                     if db_history:
                         history = deserialize_history(db_history)
+                    # 服务端是状态的唯一真相源：只要落了 classroom_id，
+                    # 就不再信客户端回传的 topic / hint_level。
+                    body.topic, body.hint_level = load_last_state(db, classroom_id)
                     save_message(db, classroom_id, body.user_id, "student", body.message)
+        except HTTPException:
+            raise
         except Exception as exc:
             print(f"[db] 读取历史/落库用户消息失败（改用前端历史）：{exc}", flush=True)
 
@@ -364,7 +390,12 @@ async def chat(request: Request, body: ChatRequest):
                         f"{json.dumps({'type': 'token', 'content': token})}\n\n"
                     )
 
-            _persist_assistant(classroom_id, "".join(answer_parts))
+            _persist_assistant(
+                classroom_id,
+                "".join(answer_parts),
+                assessment_state["topic"],
+                assessment_state["hint_level"],
+            )
             yield (
                 "data: "
                 f"{json.dumps({'type': 'state', 'topic': assessment_state['topic'], 'hint_level': assessment_state['hint_level'], 'misconception': assessment_state['misconception'], 'resolved': assessment_state['resolved']})}\n\n"
@@ -483,11 +514,67 @@ def api_list_messages(classroom_id: int, limit: int = 100):
                 "user_id": m.user_id,
                 "role": m.role,
                 "content": m.content,
+                "topic": m.topic,
+                "hint_level": m.hint_level,
                 "created_at": m.created_at.isoformat() if m.created_at else None,
             }
             for m in rows
         ],
     }
+
+
+@app.get("/classrooms/{classroom_id}")
+def api_get_classroom(classroom_id: int):
+    _require_db()
+    with get_db() as db:
+        room = db.get(Classroom, classroom_id)
+        if room is None:
+            raise HTTPException(
+                status_code=404, detail=f"Classroom {classroom_id} not found."
+            )
+        result = {
+            "id": room.id,
+            "name": room.name,
+            "subject": room.subject,
+            "description": room.description,
+        }
+
+
+@app.get("/classrooms/{classroom_id}/members")
+def api_list_members(classroom_id: int):
+    """课堂成员：Teacher / Student。
+
+    （AI 不作为成员记录——它以 messages.role='assistant' 参与对话，
+    给它造一个 User 会污染 User 表和角色语义。）
+    """
+    _require_db()
+    with get_db() as db:
+        if db.get(Classroom, classroom_id) is None:
+            raise HTTPException(
+                status_code=404, detail=f"Classroom {classroom_id} not found."
+            )
+        rows = (
+            db.execute(
+                select(ClassroomMember).where(
+                    ClassroomMember.classroom_id == classroom_id
+                )
+            )
+            .scalars()
+            .all()
+        )
+        result = {
+            "classroom_id": classroom_id,
+            "count": len(rows),
+            "members": [
+                {
+                    "user_id": m.user_id,
+                    "username": m.user.username,
+                    "role": m.role,
+                }
+                for m in rows
+            ],
+        }
+    return result
 
 
 @app.post("/upload")

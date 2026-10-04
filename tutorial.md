@@ -26,7 +26,7 @@ Tutor-Chatbot **原本**是一个苏格拉底式 CS 家教机器人：学生提�
   - 新建 `backend/venv/`，依赖按 `backend/requirements.txt` 安装完成（已追加 `langchain-openai`）。
   - 新建 `backend/.env`：走新增的通用 OpenAI 兼容通道，当前指向 DeepSeek（`LLM_PROVIDER=openai`、`LLM_BASE_URL=https://api.deepseek.com`、`LLM_MODEL=deepseek-flash`），`LLM_API_KEY` 留空待填。换厂商只改这三行，不用动代码。
   - 代码改动：`agent/graph.py` 新增 openai 分支（含 `DEFAULT_MODELS`）、`agent/state.py` 的 provider 白名单加入 `openai` 并设为默认值（详见第 3 课）。
-  - **已完成四次改造**：① 删除 Judge0 代码执行链路（含 `tools.py`）；② 提示基调由苏格拉底式改为中文八股讲解式（策略表、提示词、引用规则全部中文化）；③ T2 八股知识库（8 篇文档 + 中文 embedding + 常驻 Chroma，详见下文 T2 小节）；④ T3 MySQL 持久化（四张核心表 + `/chat` 落库，详见下文 T3 小节）。
+  - **已完成五次改造**：① 删除 Judge0 代码执行链路（含 `tools.py`）；② 提示基调由苏格拉底式改为中文八股讲解式（策略表、提示词、引用规则全部中文化）；③ T2 八股知识库（8 篇文档 + 中文 embedding + 常驻 Chroma，详见下文 T2 小节）；④ T3 MySQL 持久化（四张核心表 + `/chat` 落库，详见下文 T3 小节）；⑤ T4 成员校验 + 教学状态落库（详见下文 T4 小节）。
   - 后端已在 `127.0.0.1:8000` 跑起来，`GET /health` 返回 200。
 - **T0.2 已验收通过（2026-10-04）**：`LLM_API_KEY` 已填入 DeepSeek key，`/chat` 真实跑通。四轮实测结果见下表。
 - **两个验收入口**（都在 `backend/` 下用 venv 的 python 跑）：
@@ -105,6 +105,32 @@ Tutor-Chatbot **原本**是一个苏格拉底式 CS 家教机器人：学生提�
 **验收**：`python init_db.py` → 四张表就绪；`python seed_demo.py` → 五项通过；`python smoke_db.py` → 两轮对话 4 条记录，第 2 轮追问 `topic=死锁` 且回答接上上下文（资源有序分配法）。`run_tests.py` 仍 16/16。
 
 **留给 T4 的**：`topic` / `hint_level` 这些教学状态目前仍靠客户端回传，**没有落库**——所以刷新页面后虽然历史还在，但讲解深度会归零。T4 做「后端必须知道谁、在哪个课堂」时会一并解决（成员身份校验 + 教学状态持久化）。
+
+## T4 角色、课堂与教学状态（2026-10-04 完成）
+
+**两件事**：① 成员身份校验（T4.4「后端必须知道谁」）② 教学状态落库（T3 留下的缺口）。
+
+**教学状态随消息落库**：`messages` 表新增 `topic`（VARCHAR 64，可空）与 `hint_level`（INT，默认 0）。每次回答把当时的知识点和讲解深度写进 assistant 那条消息，下次请求用 `load_last_state()` 从最后一条有 topic 的消息恢复。
+
+**关键设计决策：服务端成为状态的唯一真相源。** 只要请求带了 `classroom_id`，就**不再相信客户端回传的 `topic` / `hint_level`**，一律从数据库恢复。理由：客户端传 0 既可能是「新话题」，也可能是「resolved 后重置」，服务端无法区分；与其猜，不如只认自己写进去的值。不带 `classroom_id` 的旧行为完全保留。
+
+**成员校验**：`/chat` 带 `classroom_id` + `user_id` 时，先查 `classroom_members`；不是成员直接 403。AI 不作为成员记录——它以 `messages.role='assistant'` 参与对话，给它造一个 User 会污染 User 表和角色语义。
+
+**新增端点**：`GET /classrooms/{id}`、`GET /classrooms/{id}/members`；`GET /classrooms/{id}/messages` 的返回带上 `topic` / `hint_level`。
+
+**一个必须知道的机制**：`create_all()` 只对「不存在的表」生效，**表在而列缺失它不管**。所以后期每次给模型加字段，都要在 `init_db.py` 的 `ensure_new_columns()` 里同步登记一条 ALTER，否则表结构会和代码里的模型悄悄偏离——读出来是 None，写入直接报错。
+
+**验收**（`python smoke_db.py`，三轮都**不传** topic / hint_level / history，全靠数据库恢复）：
+
+| 轮 | 提问 | topic | hint_level | 回答长度 |
+|---|---|---|---|---|
+| 1 | 什么是死锁？ | 死锁 | 0 | 257 字 |
+| 2 | 还是没太懂，能再讲细一点吗？ | 死锁 | **2** | 2587 字 |
+| 3 | 举个例子 | 死锁 | **3** | 2304 字 |
+
+`0 → 2 → 3` 就是状态恢复生效的硬证据：如果状态没恢复，每轮都会从 0 重新评估，讲解深度根本升不上去。另：非成员发消息返回 403。`run_tests.py` 仍 16/16。
+
+**留给 T5 的**：`misconception` 每轮都算出来却用完即弃，它才是 StudentProfile 薄弱点的原材料——T5 做画像时按知识点累积落库。
 
 ## 前置基础
 

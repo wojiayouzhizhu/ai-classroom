@@ -69,6 +69,34 @@ def create_database_if_missing() -> None:
         engine.dispose()
 
 
+def ensure_new_columns() -> None:
+    """给已存在的表补列。
+
+    `create_all()` 只对「不存在的表」生效，表在而列缺失它不管。
+    后期每次给模型加字段，都要在这里同步登记一条 ALTER，否则线上
+    表结构会和代码里的模型悄悄偏离（读出来是 None，写入直接报错）。
+    """
+    from sqlalchemy import inspect
+
+    from db.session import engine
+
+    insp = inspect(engine)
+    existing = {c["name"] for c in insp.get_columns("messages")}
+
+    additions = []
+    if "topic" not in existing:
+        additions.append("ADD COLUMN topic VARCHAR(64) NULL")
+    if "hint_level" not in existing:
+        additions.append("ADD COLUMN hint_level INT NOT NULL DEFAULT 0")
+
+    if not additions:
+        return
+    with engine.connect() as conn:
+        conn.execute(text("ALTER TABLE messages " + ", ".join(additions)))
+        conn.commit()
+    print("messages 表补充列：", ", ".join(additions))
+
+
 def create_tables() -> None:
     from db.session import engine
 
@@ -76,6 +104,7 @@ def create_tables() -> None:
         raise SystemExit("engine 未创建，请检查 backend/.env 的 MYSQL_* 配置")
 
     Base.metadata.create_all(engine)
+    ensure_new_columns()
     print("数据表已创建：")
     for table in Base.metadata.sorted_tables:
         cols = ", ".join(c.name for c in table.columns)
