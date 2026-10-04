@@ -3,5 +3,8 @@
 .uvicorn.log
 .pip.log
 
+# 验收脚本跑完写的输出快照（每次覆盖，不进版本库）
+*_out.txt
+
 # 本机工作数据（非源码，不进版本库）
 .workbuddy/

@@ -176,6 +176,49 @@ Tutor-Chatbot **原本**是一个苏格拉底式 CS 家教机器人：学生提�
 
 **留给 T6 的**：画像现在只是「存下来了」，还没被喂回提示词。T6 要做的就是把 `overall_level` + 当前知识点的 `knowledge_mastery` + `weak_points` 拼进 `system_content`，让 beginner 和 advanced 拿到不同深度的讲解。
 
+## T6 个性化提示词（2026-10-04 完成）
+
+**新增 `agent/personalize.py`，与 `profiler.py` 分家**：profiler 负责「写画像」，personalize 负责「用画像」。它把画像翻译成一段可以直接拼进 `system_content` 的中文说明，是纯函数——同一份画像必须产出同一段话，这样才能单测、也能开一个不花钱的预览接口。
+
+**两个维度的分工，避免打架**：
+
+- `hint_level` 管「讲多少」（信息量 / 展开到第几层），由评估节点的现场证据决定
+- 画像管「怎么讲」（术语门槛、要不要铺垫、该防哪些坑）
+
+画像**不去覆盖** `hint_level`——后者是学生现场没听懂才往上涨的负反馈信号，拿统计猜测压过现场证据会出事。唯一例外是 `suggest_start_level()`：换知识点时，若**这个知识点**历史掌握度 ≥0.75，起步深度可以从「一句话结论」抬到「标准答案」。
+
+> 为什么不用 `overall_level` 去抬：整体强 ≠ 这个知识点强。一个 advanced 学生第一次接触「MySQL 索引」，用整体水平抬起步深度会让他直接跳过结论层，而他对这个知识点一无所知。
+
+**冷启动必须完全退化为 T5 之前的行为**。`get_or_create_profile` 会造出全空的 beginner 画像，那种不能当真人画像用——否则等于把每个新学生先入为主地当成基础薄弱。`has_signal()` 要求画像里至少有一条实质数据（mastery / weak_points / 非默认偏好）才注入。
+
+---
+
+**过程中挖出两个 T4 遗留的真 bug**，都是这次验收才暴露的：
+
+**Bug 3：同一个课堂里，多个学生的对话和教学状态互相串。** `load_history()` 和 `load_last_state()` 都只按 `classroom_id` 取最后一条，不区分是谁的。表现是新学生第一次提问就拿到 `hint_level=2` 的 1994 字长篇——他其实什么都没问过，继承的是同课堂另一个学生的状态。
+
+修法两处：① `load_history` / `load_last_state` 加 `user_id` 参数，按学生隔离；② **assistant 回复落库时也要写 `user_id`**（含义是「这条回复是给谁的」）。原来一律写 `NULL`，导致所有人的对话线混在一起分不开。老数据 `user_id IS NULL` 当作公共消息继续可见，避免升级后上下文凭空断掉。
+
+> 副作用要心里有数：现在每个学生在课堂里有一条独立的对话线，`/classrooms/{id}/messages` 仍然是全课堂的（教师视角需要）。
+
+**Bug 4：`api_list_members` 丢了路由装饰器**，`GET /classrooms/{id}/members` 一直返回 405。跑 `smoke_db.py` 才撞出来——之前的验收脚本没覆盖这个端点。
+
+---
+
+**验收**（`python smoke_personalize.py`，3 次真实对话 + 2 次免费预览）：
+
+同一个知识点「死锁」，A 的画像 0.2、B 的画像 0.9：
+
+| | 起步深度 | 实际深度 | 回答 |
+|---|---|---|---|
+| A（beginner，0.2） | 0 | 0 | 484 字，围绕一句话结论解释关键词 |
+| B（advanced，0.9） | **1** | 1 | 316 字，直接给四个必要条件 + 预防 |
+| C（新学生） | — | 0 | 403 字，`personalized=false` ✓ |
+
+`/chat` 的 SSE state 事件新增 `personalized` 字段，前端能直接看到这一轮有没有吃到画像。另外开了 `GET /students/{id}/prompt-preview`：不打 LLM 就能看到「同一道题、两种画像」的提示词差在哪，调提示词时迭代快得多。
+
+新增 `tests/test_personalize.py`（21 例）+ `tests/test_repository.py`（7 例，内存 SQLite，不依赖 MySQL），`run_tests.py` **66/66**。T4 持久化回归 `smoke_db.py` 复跑通过（`hint_level` 0→2→3）。
+
 ## 前置基础
 
 - Python 异步（`async/await`、`asyncio.to_thread`）

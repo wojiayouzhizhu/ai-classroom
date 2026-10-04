@@ -26,6 +26,13 @@ from slowapi.errors import RateLimitExceeded
 from slowapi.util import get_remote_address
 
 from agent.graph import assessment_graph, get_llm, get_model
+from agent.personalize import (
+    apply_profile,
+    build_profile_brief,
+    load_profile,
+    preview_prompt,
+    suggest_start_level,
+)
 from agent.profiler import apply_turn, derive_level, get_or_create_profile, profile_to_dict
 from agent.rag.indexer import build_index, load_knowledge_index
 from agent.rag.retriever import get_knowledge_context, get_relevant_context
@@ -160,15 +167,20 @@ def _persist_assistant(
     answer: str,
     topic: str = "",
     hint_level: int = 0,
+    user_id: int | None = None,
 ) -> None:
-    """把助手回复连同当时的教学状态落库。落库失败绝不能影响已经发出的回答。"""
+    """把助手回复连同当时的教学状态落库。落库失败绝不能影响已经发出的回答。
+
+    user_id 记的是「这条回复是给谁的」——不写的话下一次请求恢复状态时
+    分不清这是谁的那条线，多人课堂会串台。
+    """
     if classroom_id is None or not answer.strip():
         return
     try:
         with get_db() as db:
             if db is not None:
                 save_message(
-                    db, classroom_id, None, "assistant", answer, topic, hint_level
+                    db, classroom_id, user_id, "assistant", answer, topic, hint_level
                 )
     except Exception as exc:
         print(f"[db] 助手回复落库失败（忽略）：{exc}", flush=True)
@@ -233,6 +245,9 @@ async def chat(request: Request, body: ChatRequest):
 
     classroom_id = _classroom_of(body)
     history = deserialize_history(body.history)
+    # T6：本轮用来个性化的画像。查不到就是 None（新学生 / 未落库），
+    # 此时提示词与 T5 之前完全一致。
+    profile: dict | None = None
 
     # 落在课堂里时：校验身份 → 恢复历史 → 恢复教学状态 → 存下本条提问。
     # 顺序有讲究：先读历史和状态再存本条，否则刚存的消息会被自己读回来、
@@ -250,13 +265,18 @@ async def chat(request: Request, body: ChatRequest):
                                 f"classroom {classroom_id}."
                             ),
                         )
-                    db_history = load_history(db, classroom_id)
+                    # 历史与状态都按学生隔离：同一个课堂里别人的问答
+                    # 混进上下文，会让「还是不懂」这类追问指代错人。
+                    db_history = load_history(db, classroom_id, body.user_id)
                     if db_history:
                         history = deserialize_history(db_history)
                     # 服务端是状态的唯一真相源：只要落了 classroom_id，
                     # 就不再信客户端回传的 topic / hint_level。
-                    body.topic, body.hint_level = load_last_state(db, classroom_id)
+                    body.topic, body.hint_level = load_last_state(
+                        db, classroom_id, body.user_id
+                    )
                     save_message(db, classroom_id, body.user_id, "student", body.message)
+                    profile = load_profile(db, body.user_id, classroom_id)
         except HTTPException:
             raise
         except Exception as exc:
@@ -325,7 +345,9 @@ async def chat(request: Request, body: ChatRequest):
                                 "data: "
                                 f"{json.dumps({'type': 'token', 'content': token})}\n\n"
                             )
-                    _persist_assistant(classroom_id, "".join(answer_parts))
+                    _persist_assistant(
+                        classroom_id, "".join(answer_parts), user_id=body.user_id
+                    )
                     yield (
                         "data: "
                         f"{json.dumps({'type': 'state', 'topic': '', 'hint_level': 0, 'misconception': '', 'resolved': False})}\n\n"
@@ -355,7 +377,9 @@ async def chat(request: Request, body: ChatRequest):
                             "data: "
                             f"{json.dumps({'type': 'token', 'content': token})}\n\n"
                         )
-                _persist_assistant(classroom_id, "".join(answer_parts))
+                _persist_assistant(
+                    classroom_id, "".join(answer_parts), user_id=body.user_id
+                )
                 yield (
                     "data: "
                     f"{json.dumps({'type': 'state', 'topic': '', 'hint_level': 0, 'misconception': '', 'resolved': False})}\n\n"
@@ -371,7 +395,16 @@ async def chat(request: Request, body: ChatRequest):
 
     async def event_stream():
         try:
-            strategy = HINT_STRATEGIES[assessment_state["hint_level"]]
+            # T6：换知识点时，画像可以把起步深度从「一句话结论」抬到
+            # 「标准答案」——但只在这个知识点历史上真掌握过时才抬。
+            # 上限取评估节点给的值：画像不能反过来压过学生现场听不懂的证据。
+            hint_level = assessment_state["hint_level"]
+            if assessment_state.get("topic_changed"):
+                hint_level = max(
+                    hint_level,
+                    suggest_start_level(profile, assessment_state["topic"]),
+                )
+            strategy = HINT_STRATEGIES[hint_level]
             misconception_note = (
                 "学生目前的具体理解偏差是："
                 f"{assessment_state['misconception']}"
@@ -400,6 +433,12 @@ async def chat(request: Request, body: ChatRequest):
 - 语言精炼，去掉寒暄和废话；能用分点就用分点。
 - 涉及术语、定义、流程时，优先使用业界公认的标准说法。
 - 讲解结束后，最多追问一句，确认学生是否理解。"""
+
+            # 画像段落接在规则之后：规则是硬约束，画像是讲法偏好，
+            # 顺序反了会让模型觉得「学生基础差」比「用中文回答」更重要。
+            system_content, personalized = apply_profile(
+                system_content, profile, assessment_state["topic"]
+            )
 
             system_content = add_rag_grounding(system_content, rag_context)
 
@@ -435,7 +474,8 @@ async def chat(request: Request, body: ChatRequest):
                 classroom_id,
                 "".join(answer_parts),
                 assessment_state["topic"],
-                assessment_state["hint_level"],
+                hint_level,
+                body.user_id,
             )
             # 画像沉淀必须在「落库回答」之后：它依赖本轮最终的
             # topic / hint_level / resolved，早一步读到的还是旧状态。
@@ -443,7 +483,7 @@ async def chat(request: Request, body: ChatRequest):
                 classroom_id,
                 body.user_id,
                 topic=assessment_state["topic"],
-                hint_level=assessment_state["hint_level"],
+                hint_level=hint_level,
                 misconception=assessment_state["misconception"],
                 resolved=assessment_state["resolved"],
                 prev_topic=body.topic,
@@ -451,7 +491,7 @@ async def chat(request: Request, body: ChatRequest):
             )
             yield (
                 "data: "
-                f"{json.dumps({'type': 'state', 'topic': assessment_state['topic'], 'hint_level': assessment_state['hint_level'], 'misconception': assessment_state['misconception'], 'resolved': assessment_state['resolved']})}\n\n"
+                f"{json.dumps({'type': 'state', 'topic': assessment_state['topic'], 'hint_level': hint_level, 'misconception': assessment_state['misconception'], 'resolved': assessment_state['resolved'], 'personalized': personalized})}\n\n"
             )
             yield "data: [DONE]\n\n"
         except Exception:
@@ -592,6 +632,9 @@ def api_get_classroom(classroom_id: int):
             "description": room.description,
         }
     return result
+
+
+@app.get("/classrooms/{classroom_id}/members")
 def api_list_members(classroom_id: int):
     """课堂成员：Teacher / Student。
 
@@ -740,6 +783,39 @@ def api_list_behaviors(
             for b in rows
         ]
     return {"user_id": user_id, "count": len(result), "behaviors": result}
+
+
+# --- T6：个性化提示词 -----------------------------------------------------
+# 画像在 /chat 里自动注入。这里额外开一个「不打 LLM 的预览」，
+# 用来验收同一道题在不同画像下讲法到底差在哪。
+
+
+@app.get("/students/{user_id}/prompt-preview")
+def api_prompt_preview(
+    user_id: int,
+    classroom_id: int,
+    topic: str = "",
+    hint_level: int = 0,
+):
+    """预览这个学生接下来会拿到什么讲法。不消耗 LLM 额度。"""
+    _require_db()
+    hint_level = max(0, min(hint_level, 3))
+    with get_db() as db:
+        if db.get(User, user_id) is None:
+            raise HTTPException(
+                status_code=404, detail=f"User {user_id} not found."
+            )
+        if db.get(Classroom, classroom_id) is None:
+            raise HTTPException(
+                status_code=404, detail=f"Classroom {classroom_id} not found."
+            )
+        profile = load_profile(db, user_id, classroom_id)
+
+    result = preview_prompt(profile, topic, hint_level, HINT_STRATEGIES)
+    result["user_id"] = user_id
+    result["classroom_id"] = classroom_id
+    result["profile"] = profile
+    return result
 
 
 @app.post("/upload")

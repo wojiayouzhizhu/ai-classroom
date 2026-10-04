@@ -1,0 +1,106 @@
+"""多学生课堂的状态隔离（T6 回归）。
+
+用内存 SQLite 跑，不依赖 MySQL——这几条规则是 SQL 语义层面的，
+换方言不影响结论，而依赖真库的测试在别人机器上跑不起来。
+
+背景：T4 的状态恢复只按课堂取最后一条消息。单人课堂看不出问题，
+一旦同一个课堂里有两个学生，A 的 topic / hint_level 就会被 B 继承，
+表现为「新学生第一次提问就拿到第 3 层讲解」。
+"""
+
+import sys
+from pathlib import Path
+import unittest
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+from sqlalchemy import create_engine
+from sqlalchemy.orm import sessionmaker
+
+from db.models import Classroom, Message, User
+from db.repository import (
+    add_member,
+    create_classroom,
+    create_user,
+    is_member,
+    load_history,
+    load_last_state,
+    save_message,
+)
+from db.session import Base
+
+
+class IsolationTests(unittest.TestCase):
+    def setUp(self):
+        self.engine = create_engine("sqlite:///:memory:")
+        Base.metadata.create_all(self.engine)
+        self.db = sessionmaker(bind=self.engine, expire_on_commit=False)()
+
+        self.room = create_classroom(self.db, "隔离测试班")
+        self.a = create_user(self.db, "stu_a")
+        self.b = create_user(self.db, "stu_b")
+        for u in (self.a, self.b):
+            add_member(self.db, self.room.id, u.id, "student")
+
+    def tearDown(self):
+        self.db.close()
+        Base.metadata.drop_all(self.engine)
+
+    def _turn(self, user_id, topic, hint_level, question):
+        """模拟一轮：学生提问（不带状态）+ AI 回复（带状态、记归属）。"""
+        save_message(self.db, self.room.id, user_id, "student", question)
+        save_message(
+            self.db, self.room.id, user_id, "assistant", f"{topic} 的讲解",
+            topic, hint_level,
+        )
+
+    def test_state_is_per_student(self):
+        """A 在学死锁讲到第 3 层，B 刚开口，不该继承 A 的状态。"""
+        self._turn(self.a.id, "死锁", 3, "死锁怎么预防")
+        topic, level = load_last_state(self.db, self.room.id, self.b.id)
+        self.assertEqual((topic, level), ("", 0))
+
+    def test_state_survives_for_the_same_student(self):
+        self._turn(self.a.id, "死锁", 2, "还是不懂")
+        topic, level = load_last_state(self.db, self.room.id, self.a.id)
+        self.assertEqual((topic, level), ("死锁", 2))
+
+    def test_new_student_starts_from_zero(self):
+        """回归：新学生第一次提问必须是第 0 层，不能继承别人的深度。"""
+        self._turn(self.a.id, "死锁", 3, "死锁怎么预防")
+        self._turn(self.b.id, "tcp三次握手", 2, "握手为什么要三次")
+        level = load_last_state(self.db, self.room.id, self.b.id)[1]
+        self.assertEqual(level, 2)  # B 自己的
+        fresh = create_user(self.db, "stu_fresh")
+        add_member(self.db, self.room.id, fresh.id, "student")
+        self.assertEqual(load_last_state(self.db, self.room.id, fresh.id), ("", 0))
+
+    def test_history_is_per_student(self):
+        self._turn(self.a.id, "死锁", 1, "死锁是什么")
+        self._turn(self.b.id, "tcp三次握手", 1, "握手是什么")
+        history = load_history(self.db, self.room.id, self.a.id)
+        contents = [h.content for h in history]
+        self.assertIn("死锁是什么", contents)
+        self.assertNotIn("握手是什么", contents)
+
+    def test_legacy_null_messages_stay_visible(self):
+        """老数据里 assistant 回复不记归属，升级后不能凭空断掉上下文。"""
+        save_message(self.db, self.room.id, None, "assistant", "旧回复", "死锁", 1)
+        history = load_history(self.db, self.room.id, self.a.id)
+        self.assertIn("旧回复", [h.content for h in history])
+
+    def test_without_user_id_keeps_classroom_scope(self):
+        """不传 user_id 时保持 T4 的课堂粒度（旧前端路径）。"""
+        self._turn(self.b.id, "tcp三次握手", 2, "握手是什么")
+        topic, level = load_last_state(self.db, self.room.id)
+        self.assertEqual((topic, level), ("tcp三次握手", 2))
+
+    def test_membership_still_checked(self):
+        outsider = create_user(self.db, "outsider")
+        self.assertTrue(is_member(self.db, self.room.id, self.a.id))
+        self.assertFalse(is_member(self.db, self.room.id, outsider.id))
+        self.assertFalse(is_member(self.db, self.room.id, None))
+
+
+if __name__ == "__main__":
+    unittest.main()

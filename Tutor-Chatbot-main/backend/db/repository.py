@@ -8,10 +8,25 @@ from __future__ import annotations
 
 from typing import List, Sequence
 
-from sqlalchemy import select
+from sqlalchemy import or_, select, true
 
 from agent.state import HistoryMessage
 from db.models import Classroom, ClassroomMember, Message, User
+
+
+def _owned_by(user_id: int | None):
+    """筛出「属于这个学生」的消息。
+
+    user_id 为空表示不按人过滤（旧行为，前端只传 session_id 时仍是课堂粒度）。
+
+    为什么要兼容 user_id IS NULL：T6 之前 assistant 回复不记归属，
+    库里已经攒了一批 NULL 的老消息。一刀切按 user_id 精确匹配会把它们
+    全部过滤掉，升级后学生的上下文凭空断掉一截。折中做法是老数据当作
+    公共消息继续可见，新数据（都带 user_id）严格按学生隔离。
+    """
+    if user_id is None:
+        return true()
+    return or_(Message.user_id == user_id, Message.user_id.is_(None))
 
 
 def create_user(db, username: str, role: str = "student") -> User | None:
@@ -65,10 +80,14 @@ def save_message(
     topic: str | None = None,
     hint_level: int = 0,
 ) -> Message | None:
-    """落一条消息。assistant 的回复 user_id 为 None。
+    """落一条消息。
 
     topic / hint_level 只对 assistant 消息有意义：记录「这次回答讲的是
     哪个知识点、讲到第几层」，下一次请求据此恢复状态。
+
+    assistant 回复也要记 user_id（T6 改）：它表示「这条回复是给谁的」。
+    原来一律写 None，导致同一个课堂里所有学生的对话混在一起分不开，
+    状态恢复只能按课堂粒度，多人课堂必然串台。
     """
     if db is None or not content:
         return None
@@ -85,12 +104,19 @@ def save_message(
     return message
 
 
-def load_last_state(db, classroom_id: int) -> tuple[str, int]:
-    """取这个课堂最后一条「有效教学状态」。
+def load_last_state(
+    db, classroom_id: int, user_id: int | None = None
+) -> tuple[str, int]:
+    """取这个学生在这个课堂里最后一条「有效教学状态」。
 
     服务端是状态的唯一真相源：只要落了 classroom_id，就不再信客户端
     回传的 topic / hint_level，一律从这里恢复。这样刷新页面、换设备、
     甚至前端压根不传状态，多轮讲解深度都不会断。
+
+    必须按学生隔离（T6 修）。原先只按课堂取最后一条，同一个课堂里
+    A 在学死锁、B 在学 TCP，两人的状态会互相覆盖：B 提问时恢复出的是
+    A 的 topic，讲解深度直接串台。表现是新学生第一次提问就拿到
+    hint_level=2 的长篇大论——他其实什么都没问过。
     """
     if db is None:
         return "", 0
@@ -99,6 +125,7 @@ def load_last_state(db, classroom_id: int) -> tuple[str, int]:
             select(Message)
             .where(
                 Message.classroom_id == classroom_id,
+                _owned_by(user_id),
                 Message.topic.isnot(None),
                 Message.topic != "",
             )
@@ -131,19 +158,24 @@ def is_member(db, classroom_id: int, user_id: int | None) -> bool:
 
 
 def load_history(
-    db, classroom_id: int, limit: int = 20
+    db, classroom_id: int, user_id: int | None = None, limit: int = 20
 ) -> List[HistoryMessage]:
-    """从数据库读回最近的对话，转成 LangChain 能吃的 history。
+    """从数据库读回这个学生最近的对话，转成 LangChain 能吃的 history。
 
     取最近 N 条后按 id 升序排列——先取末尾再反转，避免把最老的消息
     截掉（直接 order_by(id).limit(n) 拿到的是最早的 n 条）。
+
+    同样按学生隔离（T6 修）：喂给模型的上下文里如果混着别人的问答，
+    「追问」「还是不懂」这些指代就没法判断，评估节点会以为这个学生
+    已经听了好几轮还没懂，一上来就把讲解深度抬上去。
+    教师要看全课堂的对话请用 list_messages。
     """
     if db is None:
         return []
     rows = (
         db.execute(
             select(Message)
-            .where(Message.classroom_id == classroom_id)
+            .where(Message.classroom_id == classroom_id, _owned_by(user_id))
             .order_by(Message.id.desc())
             .limit(limit)
         )
