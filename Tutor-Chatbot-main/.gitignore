@@ -1,6 +1,7 @@
 # Backend
 backend/venv/
 backend/.env
+backend/chroma_kb/
 
 # Frontend (already handled by frontend/.gitignore but just in case)
 frontend/node_modules/

@@ -2,6 +2,8 @@ import asyncio
 from dataclasses import dataclass
 import json
 import os
+from functools import lru_cache
+from pathlib import Path
 import tempfile
 import time
 from typing import List
@@ -17,8 +19,8 @@ from slowapi.errors import RateLimitExceeded
 from slowapi.util import get_remote_address
 
 from agent.graph import assessment_graph, get_llm, get_model
-from agent.rag.indexer import build_index
-from agent.rag.retriever import get_relevant_context
+from agent.rag.indexer import build_index, load_knowledge_index
+from agent.rag.retriever import get_knowledge_context, get_relevant_context
 from agent.state import ChatRequest, HistoryMessage, HINT_STRATEGIES, TutorState
 
 load_dotenv()
@@ -29,6 +31,19 @@ MAX_UPLOAD_BYTES = max(
 )
 MAX_DOCUMENT_SESSIONS = max(1, int(os.getenv("MAX_DOCUMENT_SESSIONS", "100")))
 SESSION_TTL_SECONDS = max(1, int(os.getenv("SESSION_TTL_SECONDS", "3600")))
+
+# 常驻八股知识库：构建一次落盘，之后所有请求共享
+KNOWLEDGE_PERSIST_DIR = os.getenv(
+    "KNOWLEDGE_PERSIST_DIR",
+    str(Path(__file__).resolve().parent / "chroma_kb"),
+)
+KNOWLEDGE_COLLECTION = os.getenv("KNOWLEDGE_COLLECTION", "cs_basics")
+
+
+@lru_cache(maxsize=1)
+def get_knowledge_store():
+    """返回常驻知识库；还没构建过时返回 None，检索函数会兜底返回空串。"""
+    return load_knowledge_index(KNOWLEDGE_COLLECTION, KNOWLEDGE_PERSIST_DIR)
 
 RAG_GROUNDING_RULES = """知识库资料使用要求：
 - 涉及资料内容的结论，优先依据下面提供的资料片段回答。
@@ -153,8 +168,10 @@ async def chat(request: Request, body: ChatRequest):
             detail="The configured language model could not assess the message.",
         ) from exc
 
+    # 两套检索来源：① 学生本次上传的 PDF（会话级、内存、一小时过期）
+    #              ② 常驻八股知识库（跨请求共享、落盘）
     session = sessions.get(body.session_id) if body.session_id else None
-    rag_context = (
+    doc_context = (
         await asyncio.to_thread(
             get_relevant_context,
             session.vectorstore,
@@ -163,9 +180,16 @@ async def chat(request: Request, body: ChatRequest):
         if session is not None
         else ""
     )
+    kb_context = await asyncio.to_thread(
+        get_knowledge_context,
+        get_knowledge_store(),
+        body.message,
+    )
+    rag_context = "\n\n---\n\n".join(x for x in (doc_context, kb_context) if x)
 
     if assessment_state["topic"] == "unknown":
-        if rag_context:
+        # 纯寒暄不该拿知识库去回答，只有学生上传过文档时才依据文档答
+        if doc_context:
 
             async def doc_stream():
                 try:

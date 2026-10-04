@@ -26,7 +26,7 @@ Tutor-Chatbot **原本**是一个苏格拉底式 CS 家教机器人：学生提�
   - 新建 `backend/venv/`，依赖按 `backend/requirements.txt` 安装完成（已追加 `langchain-openai`）。
   - 新建 `backend/.env`：走新增的通用 OpenAI 兼容通道，当前指向 DeepSeek（`LLM_PROVIDER=openai`、`LLM_BASE_URL=https://api.deepseek.com`、`LLM_MODEL=deepseek-flash`），`LLM_API_KEY` 留空待填。换厂商只改这三行，不用动代码。
   - 代码改动：`agent/graph.py` 新增 openai 分支（含 `DEFAULT_MODELS`）、`agent/state.py` 的 provider 白名单加入 `openai` 并设为默认值（详见第 3 课）。
-  - **已完成两次业务改造**：① 删除 Judge0 代码执行链路（含 `tools.py`）；② 提示基调由苏格拉底式改为中文八股讲解式（策略表、提示词、引用规则全部中文化）。
+  - **已完成三次改造**：① 删除 Judge0 代码执行链路（含 `tools.py`）；② 提示基调由苏格拉底式改为中文八股讲解式（策略表、提示词、引用规则全部中文化）；③ T2 八股知识库（8 篇文档 + 中文 embedding + 常驻 Chroma，详见下文 T2 小节）。
   - 后端已在 `127.0.0.1:8000` 跑起来，`GET /health` 返回 200。
 - **T0.2 已验收通过（2026-10-04）**：`LLM_API_KEY` 已填入 DeepSeek key，`/chat` 真实跑通。四轮实测结果见下表。
 - **两个验收入口**（都在 `backend/` 下用 venv 的 python 跑）：
@@ -53,6 +53,25 @@ Tutor-Chatbot **原本**是一个苏格拉底式 CS 家教机器人：学生提�
 1. **hint_level 是跳跃的**：第 2 轮从 0 直接跳到 2，不是逐层 +1。规则只说"提高"，没约束步长，模型自由裁量。
 2. **misconception 四轮全为空**：它是 StudentProfile 薄弱点的原材料（见第 2 课），一直为空意味着 T5 画像拿不到数据。需要判断是评估 prompt 太宽松，还是这几轮确实没有误解——建议后续用明显错误说法（如"死锁就是进程死循环"）复测。
 3. **策略约束是软的**：第 1 轮 hint_level=0 要求"一句话结论"，但学生直接问"有哪些"，模型还是列了完整四条。这是合理取舍，不是 bug——说明策略文案是风格约束而非硬限制。
+
+## T2 八股知识库（2026-10-04 完成）
+
+**内容**：`knowledge/cs/os/`（进程与线程、死锁、虚拟内存与页面置换、进程调度算法）+ `knowledge/cs/network/`（TCP 三次握手与四次挥手、TCP 与 UDP、HTTPS 与 TLS、TCP/IP 分层与 ARP/DNS），共 8 篇，每篇按「一句话结论 → 标准答案 → 原理展开 → 面试常问」组织，正好对应讲解深度四层。
+
+**链路**：Markdown → 切分（500 字/重叠 80，按 `## ` 标题优先）→ 中文 embedding → Chroma 落盘 `backend/chroma_kb/`
+
+- `indexer.py`：embedding 由 `bge-small-en-v1.5`（英文）换成 **`BAAI/bge-small-zh-v1.5`**；新增 `load_markdown_documents()` / `build_knowledge_index()` / `load_knowledge_index()`，metadata 为 `subject / category / topic / source`；PDF 版 `build_index()` 原样保留，两套 collection 互不干扰。
+- `retriever.py`：新增 `get_knowledge_context()`，输出中文标注 `[知识点｜分类｜来源]`。
+- `build_kb.py`：构建入口，带检索自检。
+- `app.py`：`get_knowledge_store()`（lru_cache）常驻加载；**两套检索来源**——上传 PDF 的会话级上下文 `doc_context` + 常驻知识库 `kb_context`；`topic == "unknown"` 只在有上传文档时才走 `doc_stream`，否则打招呼（否则知识库常驻会让寒暄也去检索，永远不会走打招呼分支）。
+
+**三个环境坑（下次照做）**：
+
+1. **下载模型要走国内镜像**：`HF_ENDPOINT=https://hf-mirror.com`，否则直连 HuggingFace 会被代理挡掉（ProxyError 502）。
+2. **Windows 建不了符号链接**：huggingface_hub 默认用 symlink 组装 `snapshots/`，本机没权限会静默失败，报 `model_optimized.onnx doesn't exist`。加 `HF_HUB_DISABLE_SYMLINKS=1` 改用复制即可。
+3. **Chroma 持久化是追加语义**：重复构建会翻倍（66 → 132）。`build_kb.py` 里已经加了 `drop_collection()` 保证幂等。
+
+**验收**：`python build_kb.py` → 66 切片；三个测试问题（TCP 三次握手 / 死锁必要条件 / 进程与线程区别）回答均直接命中知识库内容，表格与措辞一致。
 
 ## 前置基础
 
