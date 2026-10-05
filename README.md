@@ -81,7 +81,7 @@ python smoke_resource.py   # 验教师备课大纲与 .pptx 生成（需服务�
 | 六 | StudentProfile 学生画像 | ✅ |
 | 七 | 个性化 Prompt（画像 + RAG + 问题 组合进提示词） | ✅ |
 | 八 | Teacher Resource Agent（备课大纲 JSON + .pptx） | ✅ |
-| 九 | 前后端联调 | 待前端 |
+| 九 | 前后端联调（接口契约见 `API_CONTRACT.md`） | 待前端 |
 | 十~十二 | 测试、性能记录、项目整理 | 收尾 |
 
 改造过程与踩坑记录在 `tutorial.md`，每一阶段一个 git 提交。

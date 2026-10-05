@@ -612,14 +612,20 @@ def api_list_messages(classroom_id: int, limit: int = 100):
     limit = max(1, min(limit, 500))
     with get_db() as db:
         rows = list_messages(db, classroom_id, limit)
-    return {
-        "classroom_id": classroom_id,
-        "count": len(rows),
-        "messages": [
+        # 序列化必须在 session 生命周期内完成。凡是要访问 ORM 对象的
+        # relationship（这里每条消息都要读 m.user.username），一旦放到
+        # with 块外面就会 detached，触发延迟加载直接 500。
+        # username 是给前端渲染「谁说的」用的。assistant 消息虽然也记了
+        # user_id（T6 改的，含义是「这条回复是给谁的」，用来在多人课堂里
+        # 区分对话线），但直接拿它取 username 会把 AI 的回答渲染成学生的
+        # 发言 —— 张冠李戴。AI 的发言人一律为 null，前端按 role 显示「AI」。
+        messages = [
             {
                 "id": m.id,
                 "user_id": m.user_id,
-                "username": m.user.username if m.user else None,
+                "username": (
+                    m.user.username if (m.user and m.role != "assistant") else None
+                ),
                 "role": m.role,
                 "content": m.content,
                 "topic": m.topic,
@@ -627,8 +633,8 @@ def api_list_messages(classroom_id: int, limit: int = 100):
                 "created_at": m.created_at.isoformat() if m.created_at else None,
             }
             for m in rows
-        ],
-    }
+        ]
+    return {"classroom_id": classroom_id, "count": len(messages), "messages": messages}
 
 
 @app.get("/classrooms/{classroom_id}")

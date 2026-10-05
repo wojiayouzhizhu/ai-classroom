@@ -9,6 +9,7 @@ from __future__ import annotations
 from typing import List, Sequence
 
 from sqlalchemy import or_, select, true
+from sqlalchemy.orm import joinedload
 
 from agent.state import HistoryMessage
 from db.models import Classroom, ClassroomMember, Message, User
@@ -193,15 +194,24 @@ def load_history(
 
 
 def list_messages(db, classroom_id: int, limit: int = 100) -> List[Message]:
+    """课堂全量消息（群聊视图），按 id 升序。
+
+    预加载 user：调用方（app.py 的 api_list_messages）要用 m.user.username
+    给每条消息标出发言人。不预加载的话，每条消息都会各触发一次延迟查询
+    （100 条消息 = 101 次 SQL），而且在 session 关闭后再访问会直接抛
+    DetachedInstanceError —— 500。
+    """
     if db is None:
         return []
     return list(
         db.execute(
             select(Message)
             .where(Message.classroom_id == classroom_id)
+            .options(joinedload(Message.user))
             .order_by(Message.id)
             .limit(limit)
         )
+        .unique()
         .scalars()
         .all()
     )

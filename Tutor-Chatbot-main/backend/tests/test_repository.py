@@ -31,6 +31,7 @@ from db.repository import (
     create_classroom,
     create_user,
     is_member,
+    list_messages,
     load_history,
     load_last_state,
     save_message,
@@ -121,6 +122,61 @@ class IsolationTests(unittest.TestCase):
         self.assertTrue(is_member(self.db, self.room.id, self.a.id))
         self.assertFalse(is_member(self.db, self.room.id, outsider.id))
         self.assertFalse(is_member(self.db, self.room.id, None))
+
+
+class DetachedSessionTests(unittest.TestCase):
+    """`GET /classrooms/{id}/messages` 的 500 回归。
+
+    背景：这个端点要在每条消息上读 `m.user.username` 给前端标发言人，
+    而序列化原先写在 `with get_db()` 块外面——session 已关，访问
+    relationship 触发延迟加载，直接 DetachedInstanceError → HTTP 500。
+
+    单元测试测不到路由注册，也测不到「session 生命周期」，所以这里
+    显式制造那个场景：先取消息，再关 session，最后才访问 username。
+    """
+
+    def setUp(self):
+        self.engine = create_engine("sqlite:///:memory:")
+        Base.metadata.create_all(self.engine)
+        self.db = sessionmaker(bind=self.engine, expire_on_commit=False)()
+
+        self.room = create_classroom(self.db, "detach 班")
+        self.stu = create_user(self.db, "stu_a")
+
+    def tearDown(self):
+        self.db.close()
+        Base.metadata.drop_all(self.engine)
+
+    def test_username_readable_after_session_closed(self):
+        """session 关闭后仍能安全读出 username——joinedload 必须生效。
+
+        这里 dict结尾的两个角色要覆盖到：学生消息要拿到名字，
+        assistant 消息（T6 起也记 user_id）由调用层决定怎么显示，
+        但至少要能读、不能抛异常。
+        """
+        save_message(self.db, self.room.id, self.stu.id, "student", "死锁是什么")
+        save_message(
+            self.db, self.room.id, self.stu.id, "assistant", "互斥…", "死锁", 0
+        )
+
+        rows = list_messages(self.db, self.room.id)
+        self.db.close()  # 模拟 `with get_db()` 退出
+
+        rendered = [(m.role, m.user.username if m.user else None) for m in rows]
+        self.assertEqual(
+            rendered,
+            [("student", "stu_a"), ("assistant", "stu_a")],
+        )
+
+    def test_assistant_with_null_user_is_safe(self):
+        """T6 之前的老 assistant 消息 user_id 是 NULL，不能炸。"""
+        save_message(self.db, self.room.id, None, "assistant", "旧回复", "死锁", 1)
+
+        rows = list_messages(self.db, self.room.id)
+        self.db.close()
+
+        self.assertEqual(len(rows), 1)
+        self.assertIsNone(rows[0].user)
 
 
 if __name__ == "__main__":
